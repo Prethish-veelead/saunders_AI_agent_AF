@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.python_packages/
+local.settings.json
+.deepeval/

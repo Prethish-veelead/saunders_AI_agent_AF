@@ -1,0 +1,36 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "AZURE_OPENAI_ENDPOINT": "https://<your-openai-resource>.openai.azure.com/",
+    "AZURE_OPENAI_API_KEY": "<local-dev-only-key>",
+    "AZURE_OPENAI_API_VERSION": "2024-08-01-preview",
+    "AZURE_OPENAI_CHAT_DEPLOYMENT": "gpt-4o-mini",
+
+    "MAX_INPUT_CHARS": "4000",
+    "REQUEST_TIMEOUT_SECONDS": "20",
+    "MAX_RETRIES": "3",
+    "RETRY_BASE_DELAY_SECONDS": "1.5",
+    "LOW_CONFIDENCE_THRESHOLD": "0.6",
+
+    "AZURE_TENANT_ID": "<your-tenant-id>",
+    "SHAREPOINT_CLIENT_ID": "<your-app-client-id>",
+    "SHAREPOINT_CLIENT_SECRET": "<your-app-client-secret>",
+    "SHAREPOINT_SITE_ID": "",
+    "SHAREPOINT_HOSTNAME": "contoso.sharepoint.com",
+    "SHAREPOINT_SITE_PATH": "/sites/Helpdesk",
+    "SHAREPOINT_LIST_ID": "<your-list-id>",
+
+    "LIST_FIELD_QUESTION": "Title",
+    "LIST_FIELD_ANSWER": "Answer",
+    "LIST_FIELD_CATEGORY": "Category",
+    "LIST_FIELD_KEYWORDS": "Keywords",
+
+    "LIST_CACHE_TTL_SECONDS": "7200",
+    "LIBRARY_CACHE_TTL_SECONDS": "14400",
+    "LIST_MATCH_THRESHOLD": "45",
+    "LIBRARY_MATCH_MIN_KEYWORD_HITS": "2"
+  }
+}
