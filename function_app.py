@@ -63,7 +63,16 @@ class ConfigurationError(Exception):
 
 
 class AzureOpenAIError(Exception):
-    """Raised when the Azure OpenAI API call ultimately fails."""
+    """Raised for transient Azure OpenAI failures — safe to retry (429, 5xx,
+    network-level errors)."""
+
+
+class AzureOpenAINonRetryableError(Exception):
+    """Raised for permanent Azure OpenAI failures — retrying will never
+    help (bad API key, wrong deployment name, malformed request, etc.).
+    The full detail is logged server-side; the client gets a distinct,
+    honest message rather than 'temporarily unavailable'.
+    """
 
 
 def _get_config() -> dict[str, str]:
@@ -146,7 +155,17 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
         if resp.status_code >= 500 or resp.status_code == 429:
-            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:300]}")
+        if resp.status_code >= 400:
+            # Permanent, config-level failure — bad key, wrong deployment
+            # name, malformed request, etc. Retrying changes nothing, so we
+            # raise a non-retryable error (skips the retry loop entirely)
+            # and log the full detail here since the client won't see it.
+            logger.error(
+                "Azure OpenAI classification call failed with non-retryable status %s: %s",
+                resp.status_code, resp.text[:500],
+            )
+            raise AzureOpenAINonRetryableError(f"Non-retryable error {resp.status_code}: {resp.text[:300]}")
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
@@ -347,6 +366,13 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps(response_payload), status_code=200, mimetype="application/json"
         )
 
+    except AzureOpenAINonRetryableError as exc:
+        logger.error("Azure OpenAI configuration/request error: %s", exc)
+        return _error_response(
+            "Classification service is misconfigured (check the deployment name, "
+            "endpoint, and API key). See server logs for the exact error.",
+            500,
+        )
     except AzureOpenAIError as exc:
         logger.error("Azure OpenAI error: %s", exc)
         return _error_response("Classification service temporarily unavailable. Please retry.", 502)
