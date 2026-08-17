@@ -19,9 +19,13 @@ Design decisions (per current requirements):
   4. No server-side session. State is carried via the request/response
      round-trip: the caller resends the previous response as
      `pending_request` along with the answer to the single question that was
-     asked. Follow-up answers are applied directly to the known missing
-     field — no second extraction call needed, which is both cheaper and
-     more reliable than re-running full extraction on a fragment of text.
+     asked. Follow-up date answers are parsed deterministically (cheap, no
+     AI call) when they're a clean single value; if that fails — or the
+     answer clearly states more than the one field asked about (e.g. both
+     dates, or the reason, in the same reply) — a small scoped AI call
+     extracts whatever fields the answer actually mentions instead of
+     silently dropping the extra information or corrupting the field with
+     unparsed raw text.
   5. Date sanity checks happen in code: endDate not before startDate,
      startDate not before today.
 """
@@ -160,12 +164,8 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
             return False, f"{i}.destinationCountry", f"What's the destination country for trip #{i + 1}?"
 
         start_raw = leg.get("startDate")
-        end_raw = leg.get("endDate")
         if not start_raw:
             return False, f"{i}.startDate", f"What's the start date for the trip to {country}?"
-        if not end_raw:
-            return False, f"{i}.endDate", f"What's the end date for the trip to {country}?"
-
         try:
             start_dt = date.fromisoformat(start_raw)
         except (ValueError, TypeError):
@@ -173,18 +173,21 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
                 f"I couldn't understand the start date for the trip to {country} — "
                 f"could you confirm it?"
             )
+        if start_dt < today:
+            return False, f"{i}.startDate", (
+                f"The start date for the trip to {country} is in the past — "
+                f"could you confirm the correct start date?"
+            )
+
+        end_raw = leg.get("endDate")
+        if not end_raw:
+            return False, f"{i}.endDate", f"What's the end date for the trip to {country}?"
         try:
             end_dt = date.fromisoformat(end_raw)
         except (ValueError, TypeError):
             return False, f"{i}.endDate", (
                 f"I couldn't understand the end date for the trip to {country} — "
                 f"could you confirm it?"
-            )
-
-        if start_dt < today:
-            return False, f"{i}.startDate", (
-                f"The start date for the trip to {country} is in the past — "
-                f"could you confirm the correct start date?"
             )
         if end_dt < start_dt:
             return False, f"{i}.endDate", (
@@ -200,11 +203,117 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
 
 
 # --------------------------------------------------------------------------
-# Step 4: stateless follow-up — apply one answer directly, no re-extraction
+# Step 4: stateless follow-up — apply one answer directly when it's a clean
+# single value; fall back to a scoped AI extraction when it isn't.
 # --------------------------------------------------------------------------
 
+_LEFTOVER_NOISE_CHARS = " ,.;:!?-"
+
+_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason")
+
+
+def _try_parse_clean_date(answer_text: str) -> Optional[str]:
+    """Returns an ISO date string only if the answer is (essentially) just
+    a date with nothing meaningful left over. Returns None — rather than
+    guessing — if parsing fails outright, or leftover text suggests the
+    answer also states something else (another date, the reason, etc.).
+    """
+    try:
+        parsed, leftover_tokens = date_parser.parse(answer_text, fuzzy_with_tokens=True)
+    except (ValueError, OverflowError, TypeError):
+        return None
+    leftover = "".join(leftover_tokens).strip(_LEFTOVER_NOISE_CHARS).strip()
+    if leftover:
+        return None
+    return parsed.date().isoformat()
+
+
+def _extract_followup_fields(
+    leg: dict[str, Any], field: str, answer_text: str, config: dict[str, str]
+) -> dict[str, Any]:
+    """Scoped fallback used only when the deterministic date parse can't
+    cleanly consume the answer on its own (e.g. it also states the reason,
+    or both dates at once). Extracts whatever fields the answer actually
+    states — never guesses at ones it doesn't mention.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "The user was asked a single question about one field of a partially "
+        "collected travel request, but their answer may state more than just "
+        "that field.\n\n"
+        f"Current known trip details (null means still missing): {json.dumps(leg)}\n"
+        f'The question asked was about: "{field}"\n\n'
+        "Extract any of the following fields the answer actually states. Use "
+        "null for anything not mentioned — never guess, invent, or repeat an "
+        "already-filled value unless the user is clearly correcting it. "
+        "Normalize any date to YYYY-MM-DD.\n"
+        "Respond ONLY with a JSON object matching this schema, nothing else:\n"
+        "{\n"
+        '  "destinationCountry": string or null,\n'
+        '  "startDate": string or null,\n'
+        '  "endDate": string or null,\n'
+        '  "reason": string or null\n'
+        "}"
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": answer_text},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 300,
+        "response_format": {"type": "json_object"},
+    }
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    raw_output = _with_retries(_call)
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise TravelExtractionError(f"Follow-up extraction did not return valid JSON: {exc}") from exc
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _apply_answer_via_ai(leg: dict[str, Any], field: str, answer_text: str, config: dict[str, str]) -> None:
+    try:
+        updates = _extract_followup_fields(leg, field, answer_text, config)
+    except TravelExtractionError as exc:
+        # AI fallback failed too (e.g. the model is down). Fall back to the
+        # original safe behavior: leave the raw text in the asked field so
+        # validation catches the bad format and re-prompts, rather than
+        # losing the answer entirely.
+        logger.warning("Follow-up AI extraction failed, falling back to raw text: %s", exc)
+        leg[field] = answer_text
+        return
+
+    for key in _FOLLOWUP_FIELDS:
+        value = updates.get(key)
+        if value:
+            leg[key] = value
+
+    if not leg.get(field):
+        # The AI fallback didn't manage to fill the field that was actually
+        # asked about — keep the raw text there so validation re-prompts
+        # with a clear "couldn't understand" message instead of looping
+        # silently with no new information.
+        leg[field] = answer_text
+
+
 def _apply_answer(
-    extracted: list[dict[str, Any]], missing_field_path: str, answer_text: str
+    extracted: list[dict[str, Any]], missing_field_path: str, answer_text: str, config: dict[str, str]
 ) -> list[dict[str, Any]]:
     answer_text = answer_text.strip()
     idx_str, field = missing_field_path.split(".")
@@ -214,12 +323,11 @@ def _apply_answer(
         extracted.append({"destinationCountry": None, "startDate": None, "endDate": None, "reason": None})
 
     if field in ("startDate", "endDate"):
-        try:
-            extracted[idx][field] = date_parser.parse(answer_text, fuzzy=True).date().isoformat()
-        except (ValueError, OverflowError):
-            # Leave the raw text in place — validation will catch the bad
-            # format and re-prompt with a clearer question.
-            extracted[idx][field] = answer_text
+        parsed = _try_parse_clean_date(answer_text)
+        if parsed is not None:
+            extracted[idx][field] = parsed
+        else:
+            _apply_answer_via_ai(extracted[idx], field, answer_text, config)
     else:
         extracted[idx][field] = answer_text
 
@@ -250,7 +358,7 @@ def process_travel_request(
     """
     if pending_request and pending_request.get("missing_field_path"):
         extracted = pending_request.get("extracted") or []
-        extracted = _apply_answer(extracted, pending_request["missing_field_path"], text)
+        extracted = _apply_answer(extracted, pending_request["missing_field_path"], text, config)
     else:
         extracted = _extract_fields(text, config)
 
