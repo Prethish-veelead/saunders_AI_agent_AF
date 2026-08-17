@@ -15,22 +15,7 @@
     "RETRY_BASE_DELAY_SECONDS": "1.5",
     "LOW_CONFIDENCE_THRESHOLD": "0.6",
 
-    "AZURE_TENANT_ID": "<your-tenant-id>",
-    "SHAREPOINT_CLIENT_ID": "<your-app-client-id>",
-    "SHAREPOINT_CLIENT_SECRET": "<your-app-client-secret>",
-    "SHAREPOINT_SITE_ID": "",
-    "SHAREPOINT_HOSTNAME": "contoso.sharepoint.com",
-    "SHAREPOINT_SITE_PATH": "/sites/Helpdesk",
-    "SHAREPOINT_LIST_ID": "<your-list-id>",
-
-    "LIST_FIELD_QUESTION": "Title",
-    "LIST_FIELD_ANSWER": "Answer",
-    "LIST_FIELD_CATEGORY": "Category",
-    "LIST_FIELD_KEYWORDS": "Keywords",
-
-    "LIST_CACHE_TTL_SECONDS": "7200",
-    "LIBRARY_CACHE_TTL_SECONDS": "14400",
-    "LIST_MATCH_THRESHOLD": "45",
-    "LIBRARY_MATCH_MIN_KEYWORD_HITS": "2"
+    "HELPDESK_API_BASE": "https://your-helpdesk-api.example.com",
+    "HELPDESK_API_KEY": "TESTER123"
   }
 }
