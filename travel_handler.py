@@ -162,6 +162,15 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
         country = leg.get("destinationCountry")
         if not country:
             return False, f"{i}.destinationCountry", f"What's the destination country for trip #{i + 1}?"
+        if any(ch.isdigit() for ch in country):
+            # Extraction occasionally folds dates/other fields into this one
+            # (e.g. "Cuba from 31-aug-2026 to 7-sep-2026") — no real country
+            # name contains a digit, so this always catches that case and
+            # re-asks instead of silently propagating the corrupted value.
+            return False, f"{i}.destinationCountry", (
+                f"\"{country}\" doesn't look like just a destination country — "
+                f"could you confirm just the country you're traveling to?"
+            )
 
         start_raw = leg.get("startDate")
         if not start_raw:
