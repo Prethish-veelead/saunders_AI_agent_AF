@@ -91,6 +91,8 @@ Rules:
 - Create one entry in "legs" for each distinct destination/trip mentioned in the message.
 - Normalize every date to YYYY-MM-DD regardless of how it was written in the \
 message (e.g. "26 Aug 2026" and "26-Aug-2026" both become "2026-08-26").
+- If a date is ambiguous and purely numeric (e.g. "7-9-2026" or "7/9/2026"), \
+interpret it as DD-MM-YYYY (day before month) — never MM-DD-YYYY.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
 - If no destinations are mentioned, return an empty "legs" array."""
 
@@ -228,7 +230,10 @@ def _try_parse_clean_date(answer_text: str) -> Optional[str]:
     answer also states something else (another date, the reason, etc.).
     """
     try:
-        parsed, leftover_tokens = date_parser.parse(answer_text, fuzzy_with_tokens=True)
+        # dayfirst=True: an all-numeric date like "7-9-2026" is ambiguous,
+        # and dateutil otherwise defaults to US-style MM-DD-YYYY, silently
+        # swapping day and month from what the user meant.
+        parsed, leftover_tokens = date_parser.parse(answer_text, dayfirst=True, fuzzy_with_tokens=True)
     except (ValueError, OverflowError, TypeError):
         return None
     leftover = "".join(leftover_tokens).strip(_LEFTOVER_NOISE_CHARS).strip()
@@ -260,7 +265,9 @@ def _extract_followup_fields(
         "Extract any of the following fields the answer actually states. Use "
         "null for anything not mentioned — never guess, invent, or repeat an "
         "already-filled value unless the user is clearly correcting it. "
-        "Normalize any date to YYYY-MM-DD.\n"
+        "Normalize any date to YYYY-MM-DD. If a date is ambiguous and purely "
+        'numeric (e.g. "7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY '
+        "(day before month) — never MM-DD-YYYY.\n"
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
         '  "destinationCountry": string or null,\n'
@@ -335,11 +342,20 @@ def _apply_answer(
         parsed = _try_parse_clean_date(answer_text)
         if parsed is not None:
             extracted[idx][field] = parsed
-        else:
-            _apply_answer_via_ai(extracted[idx], field, answer_text, config)
-    else:
+            return extracted
+    elif not any(ch.isdigit() for ch in answer_text):
+        # destinationCountry / reason: a plain-text answer with no digits is
+        # trusted as-is — neither field ever legitimately needs a number.
         extracted[idx][field] = answer_text
+        return extracted
 
+    # The answer wasn't a clean fit for the field that was asked about — an
+    # unparseable/absent date, or a country/reason answer containing a
+    # number (almost always a sign it also states a date, e.g. "Cuba from
+    # 31-aug-2026 to 7-sep-2026" when only asked for the destination). Fall
+    # back to a scoped AI extraction instead of guessing or storing raw text
+    # that would just get rejected — and re-asked for verbatim — later.
+    _apply_answer_via_ai(extracted[idx], field, answer_text, config)
     return extracted
 
 
