@@ -30,6 +30,7 @@ import azure.functions as func
 import requests
 
 from helpdesk_api_client import call_helpdesk_api, HelpdeskAPIConfigError, HelpdeskAPIError
+import query_handler
 import travel_handler
 
 # --------------------------------------------------------------------------
@@ -50,7 +51,7 @@ RETRY_BASE_DELAY_SECONDS = float(os.environ.get("RETRY_BASE_DELAY_SECONDS", "1.5
 # useful later for logging/analytics on ambiguous questions.
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("LOW_CONFIDENCE_THRESHOLD", "0.6"))
 
-ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "general_query"]
+ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "query_request", "general_query"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("classify_router")
@@ -127,16 +128,23 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
 
     system_prompt = (
-        "You classify an incoming chatbot question into exactly one of three "
-        'categories: "helpdesk" (IT support, password resets, hardware, '
-        'access requests, general workplace questions), "travel_request" '
-        "(booking flights/hotels, travel approvals, itineraries, "
-        'reimbursement for trips), or "general_query" (anything that isn\'t '
-        "a helpdesk issue or a travel request — e.g. asking about past "
-        "conversation history, or a question with no clear IT/travel intent). "
+        "You classify an incoming chatbot question into exactly one of four "
+        'categories:\n'
+        '- "helpdesk": a NEW IT support question (password resets, hardware, '
+        "access requests, general workplace questions).\n"
+        '- "travel_request": a request to CREATE a new trip (booking '
+        "flights/hotels, travel approvals, itineraries, reimbursement for "
+        "trips).\n"
+        '- "query_request": asking to LOOK UP an EXISTING travel request or '
+        'help-desk ticket they (or their team) already submitted — e.g. '
+        '"show my travel request to Cuba", "show me the ticket raised on '
+        'Aug 4", "what\'s the status of my request". This is a lookup, not '
+        "a new question or a new trip.\n"
+        '- "general_query": anything else that doesn\'t clearly fit the '
+        "three categories above.\n"
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
-        '  "category": "helpdesk" | "travel_request" | "general_query",\n'
+        '  "category": "helpdesk" | "travel_request" | "query_request" | "general_query",\n'
         '  "confidence": number between 0 and 1,\n'
         '  "reasoning": string (one short sentence)\n'
         "}"
@@ -250,6 +258,32 @@ def handle_travel_request(
         }
 
 
+def handle_query_request(
+    text: str, pending_request: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Classifies whether a lookup is for a travel request or a helpdesk
+    ticket and extracts search filters (see query_handler.py). Does not
+    perform the actual lookup — there's no persistence layer for either
+    record type in this codebase; whatever consumes this response owns
+    running the real search against the filters returned here.
+    """
+    try:
+        config = _get_config()
+        return query_handler.process_query_request(text, pending_request, config)
+    except query_handler.QueryExtractionError as exc:
+        logger.error("Query extraction error: %s", exc)
+        return {
+            "status": "error",
+            "message": "Unable to process that lookup right now. Please retry.",
+        }
+    except ConfigurationError as exc:
+        logger.error("Configuration error: %s", exc)
+        return {
+            "status": "error",
+            "message": "Service is misconfigured. Please contact the administrator.",
+        }
+
+
 # --------------------------------------------------------------------------
 # Input validation
 # --------------------------------------------------------------------------
@@ -327,12 +361,25 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         and previous_response.get("belongto") == "travel_request"
         and previous_response.get("status") == "incomplete"
     )
+    is_query_followup = (
+        previous_response is not None
+        and previous_response.get("belongto") == "query_request"
+        and previous_response.get("status") == "incomplete"
+    )
 
     try:
         if is_travel_followup:
             handler_result = handle_travel_request(text, pending_request=previous_response)
             response_payload = {"type": "fetch", "belongto": "travel_request", **handler_result}
             logger.info("Continued in-progress travel request.")
+            return func.HttpResponse(
+                json.dumps(response_payload), status_code=200, mimetype="application/json"
+            )
+
+        if is_query_followup:
+            handler_result = handle_query_request(text, pending_request=previous_response)
+            response_payload = {"type": "fetch", "belongto": "query_request", **handler_result}
+            logger.info("Continued in-progress query request.")
             return func.HttpResponse(
                 json.dumps(response_payload), status_code=200, mimetype="application/json"
             )
@@ -349,6 +396,8 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             handler_result = handle_travel_request(text)
         elif classification["category"] == "helpdesk":
             handler_result = handle_helpdesk_request(text)
+        elif classification["category"] == "query_request":
+            handler_result = handle_query_request(text)
         else:
             handler_result = handle_general_query(text)
 
