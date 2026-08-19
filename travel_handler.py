@@ -162,14 +162,23 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
 
     Checks each leg in turn and returns the FIRST problem found — we ask
     one thing at a time. No approver field — travel requests only need
-    destination, dates, and reason per leg.
+    destination, dates, and reason per leg. Per-leg priority is reason,
+    then destination, then dates: the purpose of the trip is asked about
+    before anything else, even if the destination was already given.
     """
     if not extracted:
-        return False, "0.destinationCountry", "Where are you traveling to?"
+        return False, "0.reason", "What's the reason for your trip?"
 
     today = date.today()
     for i, leg in enumerate(extracted):
         country = leg.get("destinationCountry")
+
+        reason = leg.get("reason")
+        if not reason:
+            if country:
+                return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
+            return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
+
         if not country:
             return False, f"{i}.destinationCountry", f"What's the destination country for trip #{i + 1}?"
         if any(ch.isdigit() for ch in country):
@@ -213,10 +222,6 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
                 f"The end date for the trip to {country} is before the start date — "
                 f"could you confirm the correct end date?"
             )
-
-        reason = leg.get("reason")
-        if not reason:
-            return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
 
     return True, None, None
 
