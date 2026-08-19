@@ -73,21 +73,29 @@ def _with_retries(fn, *args, **kwargs):
 # Step 1: single-shot extraction (first message only)
 # --------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You extract structured travel request data from a user's message.
+def _build_extraction_system_prompt() -> str:
+    # Built per-call (not a module-level constant) so it always reflects the
+    # real current date — the model has no other way to know "today" and
+    # will otherwise default an omitted year to whatever it learned during
+    # training (observed: 2023) instead of the actual current year.
+    today = date.today().isoformat()
+    return f"""You extract structured travel request data from a user's message.
 
 Respond ONLY with a JSON object matching this exact schema, nothing else:
-{
+{{
   "legs": [
-    {
+    {{
       "destinationCountry": string or null,
       "startDate": string or null,
       "endDate": string or null,
       "reason": string or null
-    }
+    }}
   ]
-}
+}}
 
 Rules:
+- Today's date is {today}. If a date does not mention a year, assume the \
+current year from today's date above — never guess a different year.
 - Create one entry in "legs" for each distinct destination/trip mentioned in the message.
 - Normalize every date to YYYY-MM-DD regardless of how it was written in the \
 message (e.g. "26 Aug 2026" and "26-Aug-2026" both become "2026-08-26").
@@ -106,7 +114,7 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
     payload = {
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": _build_extraction_system_prompt()},
             {"role": "user", "content": text},
         ],
         "temperature": 0.0,
@@ -256,18 +264,22 @@ def _extract_followup_fields(
         f"?api-version={AZURE_OPENAI_API_VERSION}"
     )
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    today = date.today().isoformat()
     system_prompt = (
         "The user was asked a single question about one field of a partially "
         "collected travel request, but their answer may state more than just "
         "that field.\n\n"
+        f"Today's date is {today}.\n"
         f"Current known trip details (null means still missing): {json.dumps(leg)}\n"
         f'The question asked was about: "{field}"\n\n'
         "Extract any of the following fields the answer actually states. Use "
         "null for anything not mentioned — never guess, invent, or repeat an "
         "already-filled value unless the user is clearly correcting it. "
-        "Normalize any date to YYYY-MM-DD. If a date is ambiguous and purely "
-        'numeric (e.g. "7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY '
-        "(day before month) — never MM-DD-YYYY.\n"
+        "Normalize any date to YYYY-MM-DD. If a date does not mention a year, "
+        "assume the current year from today's date above — never guess a "
+        "different year. If a date is ambiguous and purely numeric (e.g. "
+        '"7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY (day before '
+        "month) — never MM-DD-YYYY.\n"
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
         '  "destinationCountry": string or null,\n'
