@@ -180,6 +180,8 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
             return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
 
         if not country:
+            if i == 0:
+                return False, f"{i}.destinationCountry", "Where are you traveling to?"
             return False, f"{i}.destinationCountry", f"What's the destination country for trip #{i + 1}?"
         if any(ch.isdigit() for ch in country):
             # Extraction occasionally folds dates/other fields into this one
