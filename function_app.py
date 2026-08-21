@@ -51,7 +51,7 @@ RETRY_BASE_DELAY_SECONDS = float(os.environ.get("RETRY_BASE_DELAY_SECONDS", "1.5
 # useful later for logging/analytics on ambiguous questions.
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("LOW_CONFIDENCE_THRESHOLD", "0.6"))
 
-ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "query_request", "general_query"]
+ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "query_request", "ambiguous_request", "general_query"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("classify_router")
@@ -128,23 +128,43 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
 
     system_prompt = (
-        "You classify an incoming chatbot question into exactly one of four "
-        'categories:\n'
-        '- "helpdesk": a NEW IT support question (password resets, hardware, '
-        "access requests, general workplace questions).\n"
-        '- "travel_request": a request to CREATE a new trip (booking '
-        "flights/hotels, travel approvals, itineraries, reimbursement for "
-        "trips).\n"
-        '- "query_request": asking to LOOK UP an EXISTING travel request or '
-        'help-desk ticket they (or their team) already submitted — e.g. '
-        '"show my travel request to Cuba", "show me the ticket raised on '
-        'Aug 4", "what\'s the status of my request". This is a lookup, not '
-        "a new question or a new trip.\n"
-        '- "general_query": anything else that doesn\'t clearly fit the '
-        "three categories above.\n"
+        "You classify an incoming chatbot question into exactly one of five "
+        "categories. IMPORTANT: completeness is NEVER a reason to pick "
+        '"ambiguous_request" or "general_query" — missing details like a '
+        "destination, dates, or a specific IT symptom are always resolved "
+        "later by follow-up questions, not by classification. The ONLY "
+        "question you're answering here is WHICH TOPIC the message is "
+        "about (travel vs. IT/helpdesk vs. neither), never whether enough "
+        "detail was given.\n\n"
+        "Decide in this exact order, stopping at the first match:\n\n"
+        "1. Does the message mention looking up / checking / showing an "
+        "EXISTING travel request or helpdesk ticket already submitted "
+        '(e.g. "show my travel request to Cuba", "show me the ticket '
+        'raised on Aug 4", "what\'s the status of my request")? -> '
+        '"query_request".\n'
+        '2. Does the message contain the word "travel" or "trip", a '
+        "destination, or travel dates — ANYWHERE, even alongside a "
+        'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
+        'request", "I need a trip to Cuba", "book a flight", "travel '
+        'approval")? -> "travel_request". This applies even with zero '
+        "other details — an empty travel request is still travel_request, "
+        "never ambiguous.\n"
+        "3. Does the message name a specific IT/workplace topic (password, "
+        'VPN, hardware, access, "ticket", "helpdesk", or similar), even '
+        'alongside a generic verb (e.g. "raise a ticket for my VPN", "open '
+        'a helpdesk ticket")? -> "helpdesk".\n'
+        "4. Does the message ask to CREATE/RAISE/OPEN a request or ticket "
+        "but name NO topic at all — no mention of travel/trip and no IT "
+        'topic (e.g. bare "raise a request", "request needs to be '
+        'raised", "can you create a request for me")? -> '
+        '"ambiguous_request" — this is the ONLY case where you ask which '
+        "topic they mean, and only because no topic word exists anywhere "
+        "in the message, never because details are missing.\n"
+        '5. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
-        '  "category": "helpdesk" | "travel_request" | "query_request" | "general_query",\n'
+        '  "category": "helpdesk" | "travel_request" | "query_request" | '
+        '"ambiguous_request" | "general_query",\n'
         '  "confidence": number between 0 and 1,\n'
         '  "reasoning": string (one short sentence)\n'
         "}"
@@ -258,6 +278,51 @@ def handle_travel_request(
         }
 
 
+def handle_ambiguous_request(text: str) -> dict[str, Any]:
+    """Fresh message classified as "wants to raise/create something but
+    doesn't say what kind" — asks the user to say which before committing
+    to either the travel or helpdesk flow.
+    """
+    return {
+        "status": "incomplete",
+        "original_text": text,
+        "missing_field": "request_type",
+        "follow_up_question": "Is that a travel request or a helpdesk ticket?",
+    }
+
+
+def _classify_ambiguous_request_answer(answer_text: str) -> Optional[str]:
+    """Deterministic two-way match — no AI call needed for a binary choice
+    like this (same pattern as query_handler's record-type disambiguation)."""
+    lowered = answer_text.strip().lower()
+    if "travel" in lowered or "trip" in lowered:
+        return "travel_request"
+    if "helpdesk" in lowered or "help desk" in lowered or "help-desk" in lowered or "ticket" in lowered:
+        return "helpdesk"
+    return None
+
+
+def resolve_ambiguous_request(text: str, pending_request: dict[str, Any]) -> dict[str, Any]:
+    """Follow-up: the user has now said travel or helpdesk. Routes into
+    that category's normal handler using the ORIGINAL ambiguous message
+    (which carried no extractable info of its own) rather than the
+    disambiguation answer itself.
+
+    Unlike every other follow-up handler, this one returns "belongto"
+    itself — which category this resolves to is only known here, whereas
+    the caller already knows the category before calling the others.
+    """
+    original_text = pending_request.get("original_text", text)
+    resolved = _classify_ambiguous_request_answer(text)
+
+    if resolved == "travel_request":
+        return {"belongto": "travel_request", **handle_travel_request(original_text)}
+    if resolved == "helpdesk":
+        return {"belongto": "helpdesk", **handle_helpdesk_request(original_text)}
+
+    return {"belongto": "ambiguous_request", **handle_ambiguous_request(original_text)}
+
+
 def handle_query_request(
     text: str, pending_request: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
@@ -366,6 +431,11 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         and previous_response.get("belongto") == "query_request"
         and previous_response.get("status") == "incomplete"
     )
+    is_ambiguous_request_followup = (
+        previous_response is not None
+        and previous_response.get("belongto") == "ambiguous_request"
+        and previous_response.get("status") == "incomplete"
+    )
 
     try:
         if is_travel_followup:
@@ -384,6 +454,14 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
                 json.dumps(response_payload), status_code=200, mimetype="application/json"
             )
 
+        if is_ambiguous_request_followup:
+            handler_result = resolve_ambiguous_request(text, previous_response)
+            response_payload = {"type": "fetch", **handler_result}
+            logger.info("Resolved ambiguous create-request to '%s'.", handler_result.get("belongto"))
+            return func.HttpResponse(
+                json.dumps(response_payload), status_code=200, mimetype="application/json"
+            )
+
         classification = _classify_question(text, config)
 
         if classification["confidence"] < LOW_CONFIDENCE_THRESHOLD:
@@ -398,6 +476,8 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             handler_result = handle_helpdesk_request(text)
         elif classification["category"] == "query_request":
             handler_result = handle_query_request(text)
+        elif classification["category"] == "ambiguous_request":
+            handler_result = handle_ambiguous_request(text)
         else:
             handler_result = handle_general_query(text)
 
