@@ -137,18 +137,21 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "about (travel vs. IT/helpdesk vs. neither), never whether enough "
         "detail was given.\n\n"
         "Decide in this exact order, stopping at the first match:\n\n"
-        "1. Does the message ask to look up / see / check / get / find / "
-        "show / pull up something implied to ALREADY exist — signaled by "
-        'a possessive like "my request", "my ticket", "my travel '
-        'request" (their own, already-submitted item), OR explicit '
-        'lookup language ("show", "what\'s the status of", "check on")? '
-        '-> "query_request". The possessive "my request"/"my ticket" '
-        "ALWAYS means something already submitted, regardless of which "
-        'retrieval verb is used — "get my request", "show my request", '
-        '"see my ticket", and "get my request now" are ALL '
-        '"query_request". Never confuse a possessive lookup like this '
-        "with creating something new, even though both mention no "
-        "travel/IT topic.\n"
+        "1. Does the message use a LOOKUP/retrieval verb or phrase — get, "
+        'show, see, check, find, list, pull up, "what\'s the status of" '
+        "— about a request or ticket that's implied to ALREADY exist? "
+        "The verb/phrase itself is the primary signal, regardless of "
+        'which article or determiner follows it: "my request" '
+        '(possessive), "the request" (definite article), "all the '
+        'requests"/"all my requests"/"list all" (enumerating existing '
+        'items) are ALL references to something already submitted — '
+        'NEVER something being created now. Examples, ALL "query_request": '
+        '"get my request", "show my request", "see my ticket", "get my '
+        'request now", "list all the request", "check the request", '
+        '"list all my requests", "what\'s the status of the request". '
+        "Contrast with rule 4 below: a lookup verb (get/show/see/check/"
+        'list/find) never means "create" — only a create verb (raise/'
+        "create/open/submit/file) does.\n"
         '2. Does the message contain the word "travel" or "trip", a '
         "destination, or travel dates — ANYWHERE, even alongside a "
         'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
@@ -160,15 +163,16 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'VPN, hardware, access, "ticket", "helpdesk", or similar), even '
         'alongside a generic verb (e.g. "raise a ticket for my VPN", "open '
         'a helpdesk ticket")? -> "helpdesk".\n'
-        "4. Does the message ask to CREATE/RAISE/OPEN/SUBMIT/FILE a NEW "
-        'request or ticket — an INDEFINITE phrasing like "a request"/"a '
-        'ticket" (NOT "my request"/"my ticket", which always means rule 1 '
-        "above instead) — and name NO topic at all (e.g. bare \"raise a "
-        'request", "request needs to be raised", "can you create a '
-        'request for me")? -> "ambiguous_request" — this is the ONLY case '
-        "where you ask which topic they mean, and only because no topic "
-        "word exists anywhere in the message, never because details are "
-        "missing.\n"
+        "4. Does the message use a CREATE verb — raise, create, open, "
+        "submit, file — for a NEW request or ticket that doesn't exist "
+        'yet, phrased indefinitely ("a request"/"a ticket", NOT "my '
+        'request"/"the request"/"all the requests", which always mean '
+        "rule 1 above instead regardless of which verb precedes them) — "
+        'and name NO topic at all (e.g. bare "raise a request", "request '
+        'needs to be raised", "can you create a request for me")? -> '
+        '"ambiguous_request" — this is the ONLY case where you ask which '
+        "topic they mean, and only because no topic word exists anywhere "
+        "in the message, never because details are missing.\n"
         '5. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
