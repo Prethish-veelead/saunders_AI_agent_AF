@@ -137,11 +137,18 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "about (travel vs. IT/helpdesk vs. neither), never whether enough "
         "detail was given.\n\n"
         "Decide in this exact order, stopping at the first match:\n\n"
-        "1. Does the message mention looking up / checking / showing an "
-        "EXISTING travel request or helpdesk ticket already submitted "
-        '(e.g. "show my travel request to Cuba", "show me the ticket '
-        'raised on Aug 4", "what\'s the status of my request")? -> '
-        '"query_request".\n'
+        "1. Does the message ask to look up / see / check / get / find / "
+        "show / pull up something implied to ALREADY exist — signaled by "
+        'a possessive like "my request", "my ticket", "my travel '
+        'request" (their own, already-submitted item), OR explicit '
+        'lookup language ("show", "what\'s the status of", "check on")? '
+        '-> "query_request". The possessive "my request"/"my ticket" '
+        "ALWAYS means something already submitted, regardless of which "
+        'retrieval verb is used — "get my request", "show my request", '
+        '"see my ticket", and "get my request now" are ALL '
+        '"query_request". Never confuse a possessive lookup like this '
+        "with creating something new, even though both mention no "
+        "travel/IT topic.\n"
         '2. Does the message contain the word "travel" or "trip", a '
         "destination, or travel dates — ANYWHERE, even alongside a "
         'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
@@ -153,13 +160,15 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'VPN, hardware, access, "ticket", "helpdesk", or similar), even '
         'alongside a generic verb (e.g. "raise a ticket for my VPN", "open '
         'a helpdesk ticket")? -> "helpdesk".\n'
-        "4. Does the message ask to CREATE/RAISE/OPEN a request or ticket "
-        "but name NO topic at all — no mention of travel/trip and no IT "
-        'topic (e.g. bare "raise a request", "request needs to be '
-        'raised", "can you create a request for me")? -> '
-        '"ambiguous_request" — this is the ONLY case where you ask which '
-        "topic they mean, and only because no topic word exists anywhere "
-        "in the message, never because details are missing.\n"
+        "4. Does the message ask to CREATE/RAISE/OPEN/SUBMIT/FILE a NEW "
+        'request or ticket — an INDEFINITE phrasing like "a request"/"a '
+        'ticket" (NOT "my request"/"my ticket", which always means rule 1 '
+        "above instead) — and name NO topic at all (e.g. bare \"raise a "
+        'request", "request needs to be raised", "can you create a '
+        'request for me")? -> "ambiguous_request" — this is the ONLY case '
+        "where you ask which topic they mean, and only because no topic "
+        "word exists anywhere in the message, never because details are "
+        "missing.\n"
         '5. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
