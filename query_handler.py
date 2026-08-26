@@ -15,7 +15,10 @@ Design (mirrors travel_handler.py):
      filter schema itself depends on which record type is being queried.
   3. If record_type is known but every filter is null, ask for at least
      one. Unlike travel request creation, filters aren't all required —
-     just enough to narrow down a search.
+     just enough to narrow down a search. An explicit "all"/"everything"/
+     "any" answer is treated as a deliberate request for every record of
+     that type, not a non-answer — it completes the query with empty
+     filters instead of re-asking the same question forever.
   4. No server-side session — state travels via `previous_response`, the
      same stateless pattern as travel_request follow-ups.
 """
@@ -23,6 +26,7 @@ Design (mirrors travel_handler.py):
 import json
 import logging
 import os
+import re
 import time
 from datetime import date
 from typing import Any, Optional
@@ -187,6 +191,21 @@ def _validate(extracted: dict[str, Any]) -> tuple[bool, Optional[str], Optional[
 # Step 3: stateless follow-up
 # --------------------------------------------------------------------------
 
+_SHOW_ALL_WORDS = {"all", "everything", "any", "anything"}
+
+
+def _wants_all(text: str) -> bool:
+    """Deterministic check: does the text explicitly ask for everything
+    rather than narrowing down to something specific (e.g. "all", "show
+    everything", "any of them")? Cheaper and more reliable than an AI call
+    for something this unambiguous — and lets a deliberate "no filter"
+    answer complete the query instead of looping the same follow-up
+    question forever when nothing else gets extracted from it.
+    """
+    words = re.findall(r"[a-z']+", text.lower())
+    return any(word in _SHOW_ALL_WORDS for word in words)
+
+
 def _classify_record_type_answer(answer_text: str) -> Optional[str]:
     """Deterministic two-way match — no AI call needed for a binary choice
     like this, unlike filter extraction which can mention any combination
@@ -296,6 +315,19 @@ def process_query_request(
 
     else:
         extracted = _extract_query(text, config)
+
+    record_type = extracted.get("record_type")
+    filters = extracted.get("filters") or {}
+    no_filters_yet = record_type in RECORD_TYPES and not any(
+        filters.get(key) for key in FILTER_KEYS.get(record_type, ())
+    )
+    if no_filters_yet and _wants_all(text):
+        # The user explicitly asked for everything rather than narrowing
+        # down — a deliberate answer, not a non-answer. Complete with no
+        # filters (meaning: return every record of this type) instead of
+        # re-asking the same question forever. Only applies once nothing
+        # else was already extracted — a real filter always takes priority.
+        return {"status": "complete", "query": {"record_type": record_type, "filters": filters}}
 
     is_complete, missing_field, follow_up_question = _validate(extracted)
 
