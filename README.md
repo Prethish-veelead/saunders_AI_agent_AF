@@ -68,7 +68,7 @@ Missing details — follow-up question:
 }
 ```
 
-A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about).
+A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about). **Exception:** if every leg already has a valid destination and dates and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
 
 **Reliability details worth knowing:**
 - Date phrasing is normalized to `YYYY-MM-DD` regardless of format (`26 Aug 2026`, `26-Aug-2026`, `2026-08-26` all work). Ambiguous all-numeric dates (`7-9-2026`) are read as day-first, not US month-first.
@@ -208,6 +208,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-28** — A multi-destination travel message where every leg is otherwise complete now asks for the reason once for all of them ("What's the reason for the trips?") instead of once per leg — one answer covers every trip in the message.
 - **2026-08-27** — Cut over to the current Function App name, `saunders-travel-classify-func` (previously `saunders-helpdesk-func` — Azure doesn't support renaming in place, so this was a new app with the same settings, then the old one was deleted). If you have the old URL saved, it no longer exists.
 - **2026-08-27** — Migrated the deployment from the development subscription to the client's own Azure subscription (ICT SND, Australia East), including the client's own Azure OpenAI resource.
 - **2026-08-26** — `query_request` now recognizes "all"/"everything"/"any" as a deliberate answer to "which one would you like to narrow down by," completing the lookup with no filter instead of re-asking the same question forever.
