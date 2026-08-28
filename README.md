@@ -1,0 +1,202 @@
+# Router Function — Chatbot Classify & Route API
+
+Azure Function backend for a chatbot. It reads an incoming message, figures out what the person actually wants, and routes it to the right flow — creating a travel request, opening a helpdesk question, looking up something already submitted, or asking a clarifying question when the message alone isn't enough to tell.
+
+This document describes **what the system does today**. It is kept up to date as the client-facing behavior changes — see the [Changelog](#changelog) at the bottom for a dated history of what changed and why.
+
+---
+
+## What it does
+
+A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns one of five outcomes:
+
+| Category | What it means | Example message |
+|---|---|---|
+| `travel_request` | Create a new trip | *"Business trip to Cuba with client, 26 Aug 2026 to 24 Sep 2026"* |
+| `helpdesk` | A new IT/workplace question | *"How do I reset my VPN password?"* |
+| `query_request` | Look up an existing travel request or helpdesk ticket | *"show my travel request to Cuba"*, *"list all the requests"* |
+| `ambiguous_request` | Wants to create/raise something, but doesn't say what kind | *"raise a request"* |
+| `general_query` | Anything else | *"what did I ask you yesterday?"* |
+
+Classification is done by an Azure OpenAI (gpt-4o-mini) call. Everything after that — extracting the right details, validating them, deciding what to ask next — is deterministic code, not left to the model to improvise.
+
+---
+
+## How a conversation works
+
+The API is **stateless** — the Function App itself remembers nothing between calls. Continuing a conversation is done by the caller (the chatbot frontend) echoing state back on each request. Every response includes a `status`:
+
+- **`"complete"`** — nothing more needed.
+- **`"incomplete"`** — the bot needs an answer to `follow_up_question` before it can finish.
+- **`"error"`** — something failed.
+
+**The contract for a caller:**
+1. When `status` comes back `"incomplete"`, show the user `follow_up_question` and save the **entire response object**.
+2. When the user replies, send their new message as `text`, and send the saved object back as `previous_response`, unmodified:
+   ```json
+   { "text": "the user's reply", "previous_response": { ...the full previous response... } }
+   ```
+3. When `status` comes back `"complete"` or `"error"`, clear the saved state — the next message starts fresh.
+
+Any client integrating with this API should check `status === "incomplete"` **generically** to decide whether to keep the conversation state — not check for one specific category. Three of the five categories currently use follow-up questions (`travel_request`, `query_request`, `ambiguous_request`), and hardcoding to just one of them silently breaks continuation for the others.
+
+---
+
+## The five categories, in detail
+
+### `travel_request` — creating a trip
+
+Extracts one or more trip "legs" (destination, dates, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → end date**.
+
+Single message, everything given:
+```json
+{
+  "type": "new", "belongto": "travel_request", "status": "complete",
+  "extracted": [
+    { "destinationCountry": "France", "startDate": "2026-08-26", "endDate": "2026-08-30", "reason": "training" }
+  ]
+}
+```
+
+Missing details — follow-up question:
+```json
+{
+  "type": "new", "belongto": "travel_request", "status": "incomplete",
+  "extracted": [],
+  "missing_field_path": "0.reason",
+  "follow_up_question": "What's the reason for your trip?"
+}
+```
+
+A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about).
+
+**Reliability details worth knowing:**
+- Date phrasing is normalized to `YYYY-MM-DD` regardless of format (`26 Aug 2026`, `26-Aug-2026`, `2026-08-26` all work). Ambiguous all-numeric dates (`7-9-2026`) are read as day-first, not US month-first.
+- A follow-up answer that gives more than the one thing asked (e.g. destination *and* both dates in one reply) is still fully captured — a smart fallback extracts everything relevant from the answer instead of only using the single field that was asked about.
+- Sanity checks run in code, not just trusted from the AI: a start date can't be in the past, an end date can't be before the start date, and a destination field that contains digits is rejected and re-asked (the AI occasionally folds a date into the destination field by mistake — this catches it every time).
+
+### `helpdesk` — a new IT/workplace question
+
+No extraction, no follow-up — the question is tagged and passed straight through. Answering it is owned by whatever consumes this response (a separate downstream system), not this Function App.
+```json
+{ "type": "new", "belongto": "helpdesk", "status": "complete", "question": "How do I reset my VPN password?" }
+```
+
+### `query_request` — looking up something already submitted
+
+Classifies which record type is being looked up (`travel_request` or `helpdesk_ticket`) and extracts search filters from the message. **This only classifies and extracts — it does not perform the actual lookup.** There is no database or storage layer in this codebase for either record type; whatever consumes this response is responsible for running the real search against the returned filters.
+
+```json
+{
+  "type": "new", "belongto": "query_request", "status": "complete",
+  "query": {
+    "record_type": "travel_request",
+    "filters": { "destinationCountry": "Cuba", "startDate": null, "endDate": null, "dateRaised": null, "ticketId": null, "description": null }
+  }
+}
+```
+
+If the record type isn't clear from the message (*"list all the requests"*, *"get my request"*, *"check the request"*), it asks first:
+```json
+{
+  "type": "new", "belongto": "query_request", "status": "incomplete",
+  "extracted": { "record_type": null, "filters": {} },
+  "missing_field": "record_type",
+  "follow_up_question": "Is that a travel request or a helpdesk ticket?"
+}
+```
+Once the record type is known, it asks for at least one filter to narrow the search — unlike creating a travel request, not every field is required, just enough to search by. Answering **"all"**, **"everything"**, or **"any"** is recognized as a deliberate "no filter, show me everything" answer and completes the query immediately, rather than looping the same question forever.
+
+Filter fields differ by record type, since the two don't share a schema:
+- **`travel_request`:** `destinationCountry`, `startDate`, `endDate`, `dateRaised` (when it was submitted), `ticketId`, `description` (free-text keyword search)
+- **`helpdesk_ticket`:** `ticketId`, `dateRaised`, `subject` (free-text keyword search), `status`
+
+### `ambiguous_request` — wants to create something, doesn't say what
+
+For messages like *"raise a request"* or *"request need to raise"* — a clear intent to create/raise/open something, but no topic at all. Asks which kind, then routes into the real `travel_request` or `helpdesk` flow using the original message once answered.
+```json
+{
+  "type": "new", "belongto": "ambiguous_request", "status": "incomplete",
+  "original_text": "raise a request",
+  "missing_field": "request_type",
+  "follow_up_question": "Is that a travel request or a helpdesk ticket?"
+}
+```
+
+**The distinction that matters:** a *lookup* verb (get/show/see/check/list/find — "get **my** request", "list all **the** requests") always means `query_request`, never this category — regardless of whether "my"/"the"/"all" is used. Only a genuinely *indefinite, topic-less* create phrasing ("**a** request", "**a** ticket") with a create verb (raise/create/open/submit/file) lands here. If the message names a topic anywhere — "travel"/"trip", a destination, dates, or an IT term like "VPN"/"password" — it's classified directly into `travel_request` or `helpdesk` instead, with no extra question asked.
+
+### `general_query` — true catch-all
+
+Anything that doesn't fit the four categories above. Tagged and passed through, same shape as `helpdesk`. No history/memory logic exists yet — that would need a persistence layer and a stable per-user identifier, neither of which exist in this codebase currently.
+```json
+{ "type": "new", "belongto": "general_query", "status": "complete", "question": "tell me a joke" }
+```
+
+---
+
+## API endpoints
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/classify` | POST | The main endpoint — everything above. Body: `{ "text": string, "previous_response"?: object }`. |
+| `/api/health` | GET | Liveness check. No external calls. Returns `{ "status": "healthy" }`. |
+| `/api/helpdesk-search` | POST | Isolated diagnostic endpoint — calls the third-party helpdesk search API directly with no classification, returning both its response and exactly what was sent to it. For verifying that integration in isolation, not part of the normal chatbot flow. |
+
+All routes require a function key by default (`http_auth_level=FUNCTION`), except where the hosting environment is configured otherwise.
+
+---
+
+## Project structure
+
+| File | Purpose |
+|---|---|
+| `function_app.py` | Entry point. HTTP trigger, input validation, the classification call, and routing between the five category handlers. |
+| `travel_handler.py` | Everything for `travel_request` — extraction, field-by-field validation, the stateless follow-up loop. |
+| `query_handler.py` | Everything for `query_request` — record-type classification, filter extraction, the "show all" shortcut. |
+| `helpdesk_api_client.py` | Thin client for the third-party helpdesk search API, used only by the `/api/helpdesk-search` diagnostic endpoint. |
+| `helpdesk_search.py` | Superseded — an earlier SharePoint-based search implementation, kept in the repo but not imported or used anywhere anymore. |
+| `host.json` | Azure Functions host configuration (logging, extension bundle, timeout). |
+| `requirements.txt` | Python dependencies: `azure-functions`, `requests`, `python-dateutil`. |
+| `local.settings.json.example` | Template for local configuration — copy to `local.settings.json` and fill in real values (never committed; see below). |
+
+---
+
+## Configuration
+
+Set via Function App settings in Azure (or `local.settings.json` for local development — copy `local.settings.json.example`, never commit the real file). No secret values are recorded here or in that example file.
+
+| Setting | Purpose |
+|---|---|
+| `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_API_KEY` | Azure OpenAI resource used for classification and extraction. |
+| `AZURE_OPENAI_API_VERSION` | Defaults to `2024-08-01-preview`. |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Defaults to `gpt-4o-mini`. |
+| `MAX_INPUT_CHARS` | Max length of an incoming message. Defaults to `4000`. |
+| `REQUEST_TIMEOUT_SECONDS` | Per-call timeout to Azure OpenAI / the helpdesk API. Defaults to `20`. |
+| `MAX_RETRIES` / `RETRY_BASE_DELAY_SECONDS` | Retry/backoff for transient failures. Defaults to `3` / `1.5`. |
+| `LOW_CONFIDENCE_THRESHOLD` | Confidence below which a classification is logged as low-confidence (still routed, not blocked). Defaults to `0.6`. |
+| `HELPDESK_API_BASE` / `HELPDESK_API_KEY` | Third-party helpdesk search API, used only by the `/api/helpdesk-search` diagnostic endpoint. |
+
+---
+
+## Known limitations
+
+- **No persistence layer.** Travel requests and helpdesk tickets are classified/extracted but never stored anywhere by this codebase. `query_request` returns filters to search by, not actual results — the real search/database lookup is owned by whatever system consumes this API.
+- **No cross-topic conversation memory.** State only persists within a single in-progress request (a travel request or query being filled in). `helpdesk` and `general_query` don't remember anything from earlier turns.
+- **`general_query` has no real logic yet.** It's a tag-and-passthrough stub, same as `helpdesk` — no history lookup, no actual answering.
+
+---
+
+## Changelog
+
+Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
+
+- **2026-08-26** — `query_request` now recognizes "all"/"everything"/"any" as a deliberate answer to "which one would you like to narrow down by," completing the lookup with no filter instead of re-asking the same question forever.
+- **2026-08-26** — Broadened lookup detection in the classifier: phrasings like "list all **the** requests" or "check the request" (not just "**my** request") are now correctly recognized as a lookup (`query_request`), not a create request.
+- **2026-08-26** — Fixed inconsistent routing between "get my request" (lookup) and "raise a request" (create) — both are now reliably distinguished by the classifier.
+- **2026-08-21** — Added `ambiguous_request`: messages like "raise a request" that want to create something but name no topic now get asked which kind before proceeding, instead of being misrouted.
+- **2026-08-19** — Added `query_request` for looking up existing travel requests/helpdesk tickets.
+- **2026-08-19** — Reordered travel request follow-up questions: reason is now asked before destination and dates.
+- **2026-08-19** — Fixed a date-handling bug where a follow-up answer with no year could resolve to the wrong year.
+- **2026-08-18** — Added a guard against the AI extraction occasionally folding a date into the destination field; extended the smart follow-up fallback to every field, not just dates; fixed ambiguous numeric dates (e.g. "7-9-2026") being read month-first instead of day-first.
+- **2026-08-17** — Replaced the SharePoint-based helpdesk search with a third-party helpdesk API integration; built the travel request intake flow (extraction, validation, stateless follow-up); added the `general_query` category and flattened the response shape.
+- **2026-08-17** — Initial version: classify + route between `helpdesk` and `travel_request`.
