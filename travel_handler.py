@@ -28,6 +28,10 @@ Design decisions (per current requirements):
      unparsed raw text.
   5. Date sanity checks happen in code: endDate not before startDate,
      startDate not before today.
+  6. If a message names multiple destinations and every leg is otherwise
+     complete, a single missing reason is asked about once for all of
+     them ("What's the reason for the trips?") rather than once per leg —
+     the answer applies to every leg still missing it.
 """
 
 import json
@@ -157,6 +161,29 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
 # Step 2 & 5: validation in code, including date sanity checks
 # --------------------------------------------------------------------------
 
+def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
+    """True if destinationCountry/startDate/endDate are all present and
+    valid for this leg — reason is checked separately. Mirrors the same
+    checks inline in _validate()'s per-leg loop below; kept as a separate
+    helper only for the multi-leg reason-batching pre-check, which needs a
+    yes/no answer rather than an early-return message.
+    """
+    country = leg.get("destinationCountry")
+    if not country or any(ch.isdigit() for ch in country):
+        return False
+    try:
+        start_dt = date.fromisoformat(leg.get("startDate"))
+    except (ValueError, TypeError):
+        return False
+    if start_dt < today:
+        return False
+    try:
+        end_dt = date.fromisoformat(leg.get("endDate"))
+    except (ValueError, TypeError):
+        return False
+    return end_dt >= start_dt
+
+
 def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Optional[str]]:
     """Returns (is_complete, missing_field_path, follow_up_question).
 
@@ -165,11 +192,24 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
     destination, dates, and reason per leg. Per-leg priority is reason,
     then destination, then dates: the purpose of the trip is asked about
     before anything else, even if the destination was already given.
+
+    Exception: if every leg already has a valid destination/dates and 2+
+    of them are missing only the reason, ask once for all of them
+    ("What's the reason for the trips?", missing_field_path "*.reason")
+    instead of once per leg — the same trip purpose commonly covers every
+    destination named in one message, and repeating the question per leg
+    would just make the user type the same answer twice.
     """
     if not extracted:
         return False, "0.reason", "What's the reason for your trip?"
 
     today = date.today()
+
+    if len(extracted) >= 2 and all(_leg_country_and_dates_valid(leg, today) for leg in extracted):
+        legs_missing_reason = sum(1 for leg in extracted if not leg.get("reason"))
+        if legs_missing_reason >= 2:
+            return False, "*.reason", "What's the reason for the trips?"
+
     for i, leg in enumerate(extracted):
         country = leg.get("destinationCountry")
 
@@ -352,7 +392,22 @@ def _apply_answer(
 ) -> list[dict[str, Any]]:
     answer_text = answer_text.strip()
     idx_str, field = missing_field_path.split(".")
-    idx = int(idx_str)
+
+    if idx_str == "*":
+        # Shared answer for every leg still missing this field (currently
+        # only "*.reason" — see _validate). A reason never legitimately
+        # contains a digit; if this one does, something's off with the
+        # answer, so fall back to the normal single-leg path (against the
+        # first leg still missing it) rather than copying something
+        # suspicious onto every leg at once.
+        if not any(ch.isdigit() for ch in answer_text):
+            for leg in extracted:
+                if not leg.get(field):
+                    leg[field] = answer_text
+            return extracted
+        idx = next((i for i, leg in enumerate(extracted) if not leg.get(field)), 0)
+    else:
+        idx = int(idx_str)
 
     while len(extracted) <= idx:
         extracted.append({"destinationCountry": None, "startDate": None, "endDate": None, "reason": None})
