@@ -148,7 +148,11 @@ All routes require a function key by default (`http_auth_level=FUNCTION`), excep
 
 ## Azure infrastructure
 
-This is deployed in the client's own Azure subscription (**ICT SND**), not a development/testing subscription. Everything below lives in one resource group so it's easy to find and, if ever needed, tear down as a unit.
+This code is deployed to **two** separate Azure environments — the client's own subscription (the one the frontend team's chatbot actually talks to) and VeeLead's own subscription (used for our own testing/verification). They are entirely separate resources with separate settings; a deploy to one does not affect the other, and both need to be redeployed to when this code changes.
+
+### Client side — ICT SND subscription
+
+Everything below lives in one resource group so it's easy to find and, if ever needed, tear down as a unit.
 
 | Resource | Name | Purpose |
 |---|---|---|
@@ -158,9 +162,16 @@ This is deployed in the client's own Azure subscription (**ICT SND**), not a dev
 | Storage account | `saundersaistorage` | Required by the Function App runtime itself (deployment packages, trigger bookkeeping). Holds no business/request data — nothing about an actual travel request or helpdesk ticket is stored here. |
 | Application Insights | `saunders-travel-classify-func` | Request logging and monitoring for the Function App, auto-created alongside it. |
 
-**Access control:** every route requires a function key (`?code=...` on the URL) except where explicitly configured otherwise — there is no anonymous access. CORS is currently open (`*`) so any web frontend can call the API from the browser; this should be narrowed to the actual chatbot's domain before this is relied on for real traffic rather than testing.
-
 **History:** this Function App was originally deployed as `saunders-helpdesk-func`. Azure doesn't support renaming a Function App in place (the name is part of its URL), so getting to the current name meant standing up a new app (`saunders-travel-classify-func`) with the same settings, cutting over, and then deleting the old one. If you have the old URL saved anywhere, it no longer exists — use the one above.
+
+### Our side — VeeLead's own subscription ("Azure Learning")
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Resource group | `rg-saunders-ai-agent` | Everything below lives here. |
+| Function App | `saunders-ai-agent-func` | Same codebase, deployed separately for our own testing/verification. Python 3.11, Linux, Consumption plan. Live at `https://saunders-ai-agent-func.azurewebsites.net`. |
+
+**Access control (both environments):** every route requires a function key (`?code=...` on the URL) — there is no anonymous access on either deployment. CORS is currently open (`*`) on the client side so any web frontend can call the API from the browser; this should be narrowed to the actual chatbot's domain before it's relied on for real traffic rather than testing.
 
 ---
 
@@ -208,6 +219,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-28** — Deployed the current codebase to both the client-side Function App (`saunders-travel-classify-func`) and VeeLead's own Function App (`saunders-ai-agent-func`) for the first time in this project's history — everything in this changelog up to this point was only pushed to GitHub before today, not actually live on either environment. Both verified healthy afterward.
 - **2026-08-28** — A multi-destination travel message where every leg is otherwise complete now asks for the reason once for all of them ("What's the reason for the trips?") instead of once per leg — one answer covers every trip in the message.
 - **2026-08-27** — Cut over to the current Function App name, `saunders-travel-classify-func` (previously `saunders-helpdesk-func` — Azure doesn't support renaming in place, so this was a new app with the same settings, then the old one was deleted). If you have the old URL saved, it no longer exists.
 - **2026-08-27** — Migrated the deployment from the development subscription to the client's own Azure subscription (ICT SND, Australia East), including the client's own Azure OpenAI resource.
