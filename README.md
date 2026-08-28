@@ -146,6 +146,24 @@ All routes require a function key by default (`http_auth_level=FUNCTION`), excep
 
 ---
 
+## Azure infrastructure
+
+This is deployed in the client's own Azure subscription (**ICT SND**), not a development/testing subscription. Everything below lives in one resource group so it's easy to find and, if ever needed, tear down as a unit.
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Resource group | `saunders-ai-agent` | Everything below lives here. Region: **Australia East**. |
+| Function App | `saunders-travel-classify-func` | Hosts this codebase. Python 3.11, Linux, **Consumption plan** — scales to zero and only costs money per execution, no charge while idle. Live at `https://saunders-travel-classify-func.azurewebsites.net`. |
+| Azure OpenAI | `Saundersaimodels` | Used for classification and extraction (see [Configuration](#configuration)). Same region as the Function App, so there's no cross-region network hop on the AI call. |
+| Storage account | `saundersaistorage` | Required by the Function App runtime itself (deployment packages, trigger bookkeeping). Holds no business/request data — nothing about an actual travel request or helpdesk ticket is stored here. |
+| Application Insights | `saunders-travel-classify-func` | Request logging and monitoring for the Function App, auto-created alongside it. |
+
+**Access control:** every route requires a function key (`?code=...` on the URL) except where explicitly configured otherwise — there is no anonymous access. CORS is currently open (`*`) so any web frontend can call the API from the browser; this should be narrowed to the actual chatbot's domain before this is relied on for real traffic rather than testing.
+
+**History:** this Function App was originally deployed as `saunders-helpdesk-func`. Azure doesn't support renaming a Function App in place (the name is part of its URL), so getting to the current name meant standing up a new app (`saunders-travel-classify-func`) with the same settings, cutting over, and then deleting the old one. If you have the old URL saved anywhere, it no longer exists — use the one above.
+
+---
+
 ## Project structure
 
 | File | Purpose |
@@ -169,7 +187,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 |---|---|
 | `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_API_KEY` | Azure OpenAI resource used for classification and extraction. |
 | `AZURE_OPENAI_API_VERSION` | Defaults to `2024-08-01-preview`. |
-| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Defaults to `gpt-4o-mini`. |
+| `AZURE_OPENAI_CHAT_DEPLOYMENT` | Defaults to `gpt-4o-mini` in code. Currently configured to `gpt-4o` in the client environment, since that's the deployment available on their Azure OpenAI resource — `gpt-4o` is slower/more expensive per call than `gpt-4o-mini`, which is worth knowing if response latency ever needs investigating. |
 | `MAX_INPUT_CHARS` | Max length of an incoming message. Defaults to `4000`. |
 | `REQUEST_TIMEOUT_SECONDS` | Per-call timeout to Azure OpenAI / the helpdesk API. Defaults to `20`. |
 | `MAX_RETRIES` / `RETRY_BASE_DELAY_SECONDS` | Retry/backoff for transient failures. Defaults to `3` / `1.5`. |
@@ -190,6 +208,8 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-27** — Cut over to the current Function App name, `saunders-travel-classify-func` (previously `saunders-helpdesk-func` — Azure doesn't support renaming in place, so this was a new app with the same settings, then the old one was deleted). If you have the old URL saved, it no longer exists.
+- **2026-08-27** — Migrated the deployment from the development subscription to the client's own Azure subscription (ICT SND, Australia East), including the client's own Azure OpenAI resource.
 - **2026-08-26** — `query_request` now recognizes "all"/"everything"/"any" as a deliberate answer to "which one would you like to narrow down by," completing the lookup with no filter instead of re-asking the same question forever.
 - **2026-08-26** — Broadened lookup detection in the classifier: phrasings like "list all **the** requests" or "check the request" (not just "**my** request") are now correctly recognized as a lookup (`query_request`), not a create request.
 - **2026-08-26** — Fixed inconsistent routing between "get my request" (lookup) and "raise a request" (create) — both are now reliably distinguished by the classifier.
