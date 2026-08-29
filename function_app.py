@@ -137,7 +137,25 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "about (travel vs. IT/helpdesk vs. neither), never whether enough "
         "detail was given.\n\n"
         "Decide in this exact order, stopping at the first match:\n\n"
-        "1. Does the message use a LOOKUP/retrieval verb or phrase — get, "
+        "1. Is the message asking for an EXPLANATION of, or INSTRUCTIONS "
+        'for, the travel-request/helpdesk-ticket FEATURES THEMSELVES — '
+        'phrased as a question about the concept or process (e.g. '
+        '"explain the travel request concept", "how do I create a travel '
+        'request", "how to get my previous request", "what\'s required to '
+        'create a travel request", "what fields do I need for a helpdesk '
+        'ticket") — rather than actually trying to create or look '
+        'something up right now? -> "helpdesk". This takes priority over '
+        'every rule below: containing "travel"/"trip", a lookup verb, or '
+        "an IT term does NOT mean the message is performing that action "
+        "if it's really asking HOW the feature works. Contrast with real "
+        "action messages, which state or imply the person's OWN trip or "
+        'lookup rather than asking about the feature in the abstract — '
+        'these are NOT explanation questions and must NOT match this '
+        'rule: "I want to travel to Cuba" (states personal intent to '
+        'travel -> rule 3 below), "trip to meet a client" (personal '
+        'intent, even with no destination given -> rule 3), "show my '
+        'tickets based on Cuba" (gives real search criteria -> rule 2).\n'
+        "2. Does the message use a LOOKUP/retrieval verb or phrase — get, "
         'show, see, check, find, list, pull up, "what\'s the status of" '
         "— about a request or ticket that's implied to ALREADY exist? "
         "The verb/phrase itself is the primary signal, regardless of "
@@ -149,31 +167,31 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         '"get my request", "show my request", "see my ticket", "get my '
         'request now", "list all the request", "check the request", '
         '"list all my requests", "what\'s the status of the request". '
-        "Contrast with rule 4 below: a lookup verb (get/show/see/check/"
+        "Contrast with rule 5 below: a lookup verb (get/show/see/check/"
         'list/find) never means "create" — only a create verb (raise/'
         "create/open/submit/file) does.\n"
-        '2. Does the message contain the word "travel" or "trip", a '
+        '3. Does the message contain the word "travel" or "trip", a '
         "destination, or travel dates — ANYWHERE, even alongside a "
         'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
         'request", "I need a trip to Cuba", "book a flight", "travel '
         'approval")? -> "travel_request". This applies even with zero '
         "other details — an empty travel request is still travel_request, "
         "never ambiguous.\n"
-        "3. Does the message name a specific IT/workplace topic (password, "
+        "4. Does the message name a specific IT/workplace topic (password, "
         'VPN, hardware, access, "ticket", "helpdesk", or similar), even '
         'alongside a generic verb (e.g. "raise a ticket for my VPN", "open '
         'a helpdesk ticket")? -> "helpdesk".\n'
-        "4. Does the message use a CREATE verb — raise, create, open, "
+        "5. Does the message use a CREATE verb — raise, create, open, "
         "submit, file — for a NEW request or ticket that doesn't exist "
         'yet, phrased indefinitely ("a request"/"a ticket", NOT "my '
         'request"/"the request"/"all the requests", which always mean '
-        "rule 1 above instead regardless of which verb precedes them) — "
+        "rule 2 above instead regardless of which verb precedes them) — "
         'and name NO topic at all (e.g. bare "raise a request", "request '
         'needs to be raised", "can you create a request for me")? -> '
         '"ambiguous_request" — this is the ONLY case where you ask which '
         "topic they mean, and only because no topic word exists anywhere "
         "in the message, never because details are missing.\n"
-        '5. Otherwise -> "general_query".\n\n'
+        '6. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
         '  "category": "helpdesk" | "travel_request" | "query_request" | '
