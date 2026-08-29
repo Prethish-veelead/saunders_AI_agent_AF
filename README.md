@@ -82,6 +82,8 @@ No extraction, no follow-up — the question is tagged and passed straight throu
 { "type": "new", "belongto": "helpdesk", "status": "complete", "question": "How do I reset my VPN password?" }
 ```
 
+This also covers questions **about** the travel-request/query-request features themselves — *"explain the travel request concept"*, *"how do I create a travel request"*, *"what's required to create a travel request"*, *"how to get a previous request"*. These are requests for an explanation, not an attempt to actually create or look something up, so they land here rather than starting the travel-creation or lookup flow. A real action — *"I want to travel to Cuba"*, *"show my tickets based on Cuba"* — still routes to `travel_request`/`query_request` as normal; only messages phrased as a question about how the feature works get redirected here.
+
 ### `query_request` — looking up something already submitted
 
 Classifies which record type is being looked up (`travel_request` or `helpdesk_ticket`) and extracts search filters from the message. **This only classifies and extracts — it does not perform the actual lookup.** There is no database or storage layer in this codebase for either record type; whatever consumes this response is responsible for running the real search against the returned filters.
@@ -219,6 +221,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-29** — Questions asking about the travel-request/helpdesk-ticket features themselves ("explain the travel request concept," "how to create a travel request," "what's required to create a travel request," "how to get a previous request") now route to `helpdesk` instead of being misrouted into starting the actual creation/lookup flow. Deployed to both environments.
 - **2026-08-28** — Deployed the current codebase to both the client-side Function App (`saunders-travel-classify-func`) and VeeLead's own Function App (`saunders-ai-agent-func`) for the first time in this project's history — everything in this changelog up to this point was only pushed to GitHub before today, not actually live on either environment. Both verified healthy afterward.
 - **2026-08-28** — A multi-destination travel message where every leg is otherwise complete now asks for the reason once for all of them ("What's the reason for the trips?") instead of once per leg — one answer covers every trip in the message.
 - **2026-08-27** — Cut over to the current Function App name, `saunders-travel-classify-func` (previously `saunders-helpdesk-func` — Azure doesn't support renaming in place, so this was a new app with the same settings, then the old one was deleted). If you have the old URL saved, it no longer exists.
