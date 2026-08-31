@@ -53,7 +53,7 @@ Single message, everything given:
 {
   "type": "new", "belongto": "travel_request", "status": "complete",
   "extracted": [
-    { "destinationCountry": "France", "startDate": "2026-08-26", "endDate": "2026-08-30", "reason": "training" }
+    { "destinationCountry": "Cuba", "startDate": "2026-10-15", "endDate": "2026-10-20", "reason": "client visit" }
   ]
 }
 ```
@@ -69,6 +69,13 @@ Missing details — follow-up question:
 ```
 
 A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about). **Exception:** if every leg already has a valid destination and dates and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
+
+**Destination is checked against an approved list**, not accepted freely — see [Approved destination list](#approved-destination-list) below. A well-formed but unapproved country is rejected the same way a malformed one is:
+```json
+{
+  "follow_up_question": "Sorry, Germany isn't a country we currently support for travel requests — could you confirm a different destination?"
+}
+```
 
 **Reliability details worth knowing:**
 - Date phrasing is normalized to `YYYY-MM-DD` regardless of format (`26 Aug 2026`, `26-Aug-2026`, `2026-08-26` all work). Ambiguous all-numeric dates (`7-9-2026`) are read as day-first, not US month-first.
@@ -136,6 +143,26 @@ Anything that doesn't fit the four categories above. Tagged and passed through, 
 
 ---
 
+## Approved destination list
+
+`destinationCountry` on a travel request isn't accepted freely — it's checked against a "CountryMaster" list maintained in SharePoint, one per deployment:
+
+| Deployment | SharePoint site | Column holding the country name |
+|---|---|---|
+| Client | `ictsnd.sharepoint.com/sites/ICT/TravelRequest` | **Location Name** |
+| Our side | `veeleaddev.sharepoint.com/sites/saunders/travelrequest` | **Country Name** |
+
+A destination not on that list is rejected and re-asked — *"Sorry, {country} isn't a country we currently support for travel requests — could you confirm a different destination?"* — the same way an obviously malformed destination already was. The list is fetched once and cached for an hour (`COUNTRY_LIST_CACHE_TTL_SECONDS`), not re-fetched on every request. If the list genuinely can't be reached (SharePoint/Graph is down, or misconfigured), that's treated as a system error — *"Unable to verify the destination right now"* — never as "allow anything through," since the whole point of the list is to enforce which countries are permitted.
+
+**Reading the list needs its own credential, and the two deployments need a genuinely different kind — not just different settings:**
+
+- **Client side** uses the Function App's own **Managed Identity** — no secret stored anywhere. This works specifically because `saunders-travel-classify-func` and the client's SharePoint site live in the *same* Entra ID tenant.
+- **Our side** uses `AZURE_TENANT_ID` / `SHAREPOINT_CLIENT_ID` / `SHAREPOINT_CLIENT_SECRET` — a traditional app-registration credential. This isn't a downgrade in security posture from a different choice; it's required, because `saunders-ai-agent-func` and `veeleaddev.sharepoint.com` sit in two *different* Entra ID tenants, and a Managed Identity is fundamentally bound to its own home tenant — it cannot be granted access to a resource in another one, regardless of what permissions get configured. Only an app registration (or workload identity federation) can be trusted across a tenant boundary that way.
+
+The code auto-selects which of the two to use based on which settings are present — see `country_list.py`.
+
+---
+
 ## API endpoints
 
 | Route | Method | Purpose |
@@ -184,10 +211,11 @@ Everything below lives in one resource group so it's easy to find and, if ever n
 | `function_app.py` | Entry point. HTTP trigger, input validation, the classification call, and routing between the five category handlers. |
 | `travel_handler.py` | Everything for `travel_request` — extraction, field-by-field validation, the stateless follow-up loop. |
 | `query_handler.py` | Everything for `query_request` — record-type classification, filter extraction, the "show all" shortcut. |
+| `country_list.py` | Fetches and caches the approved-destination list from SharePoint — see [Approved destination list](#approved-destination-list). |
 | `helpdesk_api_client.py` | Thin client for the third-party helpdesk search API, used only by the `/api/helpdesk-search` diagnostic endpoint. |
-| `helpdesk_search.py` | Superseded — an earlier SharePoint-based search implementation, kept in the repo but not imported or used anywhere anymore. |
+| `helpdesk_search.py` | Superseded — an earlier SharePoint-based *helpdesk* search implementation, kept in the repo but not imported or used anywhere anymore. Not to be confused with `country_list.py`, which is a different, current SharePoint integration for a different purpose. |
 | `host.json` | Azure Functions host configuration (logging, extension bundle, timeout). |
-| `requirements.txt` | Python dependencies: `azure-functions`, `requests`, `python-dateutil`. |
+| `requirements.txt` | Python dependencies: `azure-functions`, `requests`, `python-dateutil`, `azure-identity`. |
 | `local.settings.json.example` | Template for local configuration — copy to `local.settings.json` and fill in real values (never committed; see below). |
 
 ---
@@ -206,6 +234,9 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 | `MAX_RETRIES` / `RETRY_BASE_DELAY_SECONDS` | Retry/backoff for transient failures. Defaults to `3` / `1.5`. |
 | `LOW_CONFIDENCE_THRESHOLD` | Confidence below which a classification is logged as low-confidence (still routed, not blocked). Defaults to `0.6`. |
 | `HELPDESK_API_BASE` / `HELPDESK_API_KEY` | Third-party helpdesk search API, used only by the `/api/helpdesk-search` diagnostic endpoint. |
+| `SHAREPOINT_HOSTNAME` / `SHAREPOINT_SITE_PATH` / `SHAREPOINT_COUNTRY_LIST_ID` / `SHAREPOINT_COUNTRY_COLUMN_DISPLAY_NAME` | Where the approved-country list lives — see [Approved destination list](#approved-destination-list) for the real values on each deployment. |
+| `COUNTRY_LIST_CACHE_TTL_SECONDS` | How long the fetched country list is cached before refetching. Defaults to `3600` (1 hour). |
+| `AZURE_TENANT_ID` / `SHAREPOINT_CLIENT_ID` / `SHAREPOINT_CLIENT_SECRET` | Only needed on **our side** — the app-registration credential used to read the country list cross-tenant (see above). Not set on the client side, which uses its Managed Identity instead. |
 
 ---
 
@@ -221,6 +252,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-31** — `destinationCountry` on a travel request is now checked against an approved-country list maintained in SharePoint (see [Approved destination list](#approved-destination-list)) — a well-formed but unapproved country is now rejected and re-asked instead of accepted. Live and verified on the client side; our own side is pending the cross-tenant credential setup.
 - **2026-08-29** — Questions asking about the travel-request/helpdesk-ticket features themselves ("explain the travel request concept," "how to create a travel request," "what's required to create a travel request," "how to get a previous request") now route to `helpdesk` instead of being misrouted into starting the actual creation/lookup flow. Deployed to both environments.
 - **2026-08-28** — Deployed the current codebase to both the client-side Function App (`saunders-travel-classify-func`) and VeeLead's own Function App (`saunders-ai-agent-func`) for the first time in this project's history — everything in this changelog up to this point was only pushed to GitHub before today, not actually live on either environment. Both verified healthy afterward.
 - **2026-08-28** — A multi-destination travel message where every leg is otherwise complete now asks for the reason once for all of them ("What's the reason for the trips?") instead of once per leg — one answer covers every trip in the message.
