@@ -164,13 +164,28 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         '(possessive), "the request" (definite article), "all the '
         'requests"/"all my requests"/"list all" (enumerating existing '
         'items) are ALL references to something already submitted — '
-        'NEVER something being created now. Examples, ALL "query_request": '
-        '"get my request", "show my request", "see my ticket", "get my '
-        'request now", "list all the request", "check the request", '
-        '"list all my requests", "what\'s the status of the request". '
+        "NEVER something being created now. This only applies when the "
+        "request/ticket itself is either unqualified — no stated topic, "
+        'e.g. "my request", "my ticket" — always in scope by default — '
+        "or is plausibly a travel or IT/helpdesk matter specifically "
+        '(e.g. "travel request", "helpdesk ticket", "IT ticket", '
+        '"flight ticket"/"flight status" — travel-adjacent, in scope). '
+        'Examples, ALL "query_request": "get my request", "show my '
+        'request", "see my ticket", "get my request now", "list all the '
+        'request", "check the request", "list all my requests", '
+        '"what\'s the status of the request", "check my flight status", '
+        '"get my flight ticket". '
         "Contrast with rule 5 below: a lookup verb (get/show/see/check/"
         'list/find) never means "create" — only a create verb (raise/'
-        "create/open/submit/file) does.\n"
+        "create/open/submit/file) does. Contrast also with a lookup whose "
+        "named topic is CLEARLY outside travel/IT — a movie, concert, "
+        "restaurant, sporting event, or other personal/entertainment "
+        "booking — which does NOT match this rule even though it uses a "
+        "lookup verb, because what's being looked up is plainly not a "
+        'travel request or helpdesk ticket: "get my movie ticket to '
+        'bahubali 2", "show my concert tickets", "check my restaurant '
+        'reservation" are NOT "query_request" (they fall through to rule '
+        '6, "general_query").\n'
         '3. Does the message contain the word "travel" or "trip", a '
         "destination, or travel dates — ANYWHERE, even alongside a "
         'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
@@ -178,10 +193,17 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'approval")? -> "travel_request". This applies even with zero '
         "other details — an empty travel request is still travel_request, "
         "never ambiguous.\n"
-        "4. Does the message name a specific IT/workplace topic (password, "
-        'VPN, hardware, access, "ticket", "helpdesk", or similar), even '
-        'alongside a generic verb (e.g. "raise a ticket for my VPN", "open '
-        'a helpdesk ticket")? -> "helpdesk".\n'
+        "4. Does the message name a specific IT/workplace topic — password, "
+        'VPN, hardware, access, "helpdesk", or "ticket" specifically tied '
+        'to an IT/workplace context (e.g. "helpdesk ticket", "IT ticket", '
+        '"support ticket", "ticket for my VPN") — even alongside a generic '
+        'verb (e.g. "raise a ticket for my VPN", "open a helpdesk '
+        'ticket")? -> "helpdesk". A bare "ticket" with no IT/workplace '
+        "qualifier anywhere in the message does NOT match this rule on its "
+        'own — "book a ticket", "get a movie ticket", "buy a concert '
+        'ticket" name no IT/workplace context and must NOT be classified '
+        '"helpdesk" (the same principle as rule 2\'s contrastive example, '
+        "applied to create-style phrasing instead of lookups).\n"
         "5. Does the message use a CREATE verb — raise, create, open, "
         "submit, file — for a NEW request or ticket that doesn't exist "
         'yet, phrased indefinitely ("a request"/"a ticket", NOT "my '
@@ -271,15 +293,25 @@ def handle_helpdesk_request(text: str) -> dict[str, Any]:
 
 
 def handle_general_query(text: str) -> dict[str, Any]:
-    """Catch-all for anything that isn't clearly helpdesk or travel — e.g.
-    "show me what I've asked before". Tagged and passed through only, same
-    as helpdesk. No history/lookup logic actually runs here yet — that
-    would need a place to persist conversation records (a SharePoint list,
-    most likely, given no Azure storage account) plus a stable per-user
-    identifier on incoming requests, neither of which exist yet. This stub
-    exists so the response contract is defined and testable ahead of that.
+    """Catch-all for anything that isn't clearly helpdesk, travel, or a
+    lookup of an existing travel request/helpdesk ticket — e.g. "get my
+    movie ticket to bahubali 2", "tell me a joke", "what did I ask you
+    yesterday?". This assistant only handles travel requests and helpdesk
+    tickets, so rather than silently passing the raw question through
+    (the previous behavior), this returns a polite refusal that steers
+    the user back on-topic. No history/lookup logic runs here — that
+    would still need a persistence layer and a stable per-user
+    identifier, neither of which exist yet.
     """
-    return {"status": "complete", "question": text}
+    return {
+        "status": "complete",
+        "question": text,
+        "message": (
+            "I'm not able to help with that — I can only assist with "
+            "travel requests and helpdesk tickets. Please ask me "
+            "something related to submitting or looking up one of those."
+        ),
+    }
 
 
 def handle_travel_request(

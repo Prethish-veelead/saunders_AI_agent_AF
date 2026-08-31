@@ -16,7 +16,7 @@ A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns
 | `helpdesk` | A new IT/workplace question | *"How do I reset my VPN password?"* |
 | `query_request` | Look up an existing travel request or helpdesk ticket | *"show my travel request to Cuba"*, *"list all the requests"* |
 | `ambiguous_request` | Wants to create/raise something, but doesn't say what kind | *"raise a request"* |
-| `general_query` | Anything else | *"what did I ask you yesterday?"* |
+| `general_query` | Anything unrelated to travel requests or helpdesk tickets | *"get my movie ticket to bahubali 2"*, *"what did I ask you yesterday?"* |
 
 Classification is done by an Azure OpenAI (gpt-4o-mini) call. Everything after that — extracting the right details, validating them, deciding what to ask next — is deterministic code, not left to the model to improvise.
 
@@ -136,9 +136,13 @@ For messages like *"raise a request"* or *"request need to raise"* — a clear i
 
 ### `general_query` — true catch-all
 
-Anything that doesn't fit the four categories above. Tagged and passed through, same shape as `helpdesk`. No history/memory logic exists yet — that would need a persistence layer and a stable per-user identifier, neither of which exist in this codebase currently.
+Anything that doesn't fit the four categories above, including a lookup or IT/workplace phrase that names a topic clearly outside travel or helpdesk (e.g. a movie ticket, a restaurant reservation) — those no longer get force-fit into `query_request`/`helpdesk` just because they use a lookup verb or contain the word "ticket". Returns a polite refusal steering the user back to travel/helpdesk topics; no history/memory logic exists yet — that would need a persistence layer and a stable per-user identifier, neither of which exist in this codebase currently.
 ```json
-{ "type": "new", "belongto": "general_query", "status": "complete", "question": "tell me a joke" }
+{
+  "type": "new", "belongto": "general_query", "status": "complete",
+  "question": "get my movie ticket to bahubali 2",
+  "message": "I'm not able to help with that — I can only assist with travel requests and helpdesk tickets. Please ask me something related to submitting or looking up one of those."
+}
 ```
 
 ---
@@ -244,7 +248,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 - **No persistence layer.** Travel requests and helpdesk tickets are classified/extracted but never stored anywhere by this codebase. `query_request` returns filters to search by, not actual results — the real search/database lookup is owned by whatever system consumes this API.
 - **No cross-topic conversation memory.** State only persists within a single in-progress request (a travel request or query being filled in). `helpdesk` and `general_query` don't remember anything from earlier turns.
-- **`general_query` has no real logic yet.** It's a tag-and-passthrough stub, same as `helpdesk` — no history lookup, no actual answering.
+- **`general_query` has no history/memory logic.** It returns a fixed polite refusal rather than a stub passthrough (see 2026-08-31 changelog), but there's still no actual history lookup or general-purpose answering — that would need a persistence layer and a stable per-user identifier, neither of which exist yet.
 
 ---
 
@@ -252,6 +256,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-31** — Fixed a misclassification where a lookup for something clearly unrelated to travel/IT (e.g. "get my movie ticket to bahubali 2") was being routed to `query_request` just because it used a lookup verb ("get") next to the word "ticket" — it was then force-fit into a travel-request or helpdesk-ticket search, returning the user's unrelated travel history. Lookups and ticket-mentions are now only routed to `query_request`/`helpdesk` when the request/ticket is unqualified (e.g. "my request") or plausibly travel/IT-specific; anything else now falls to `general_query`, which returns a polite refusal instead of passing the raw question through. Live and verified on both environments.
 - **2026-08-31** — Answering "Is that a travel request or a helpdesk ticket?" (or the equivalent record-type lookup question) with a typo (e.g. "helpdisk") now resolves correctly instead of silently re-asking the exact same question — both disambiguation checks were a hardcoded keyword match with no typo tolerance, unlike the rest of the system; both now use a small AI call instead. Live and verified on both environments.
 - **2026-08-31** — A pending travel request no longer silently absorbs an unrelated reply (e.g. a helpdesk complaint typed mid-flow) into the field it was waiting on. It's now checked against the pending question first; an unrelated reply gets a "you have a travel request in progress — finish it or refresh the chat" notice instead. Live and verified on both environments.
 - **2026-08-31** — An unsupported destination country is now flagged immediately when given, before asking for the reason or dates — previously the reason was asked first even when the destination was already known to be rejected. Live and verified on both environments.
