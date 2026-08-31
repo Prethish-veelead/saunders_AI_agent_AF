@@ -252,6 +252,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-31** — A misspelled destination country (e.g. "phillipines") is now corrected to its standard name ("Philippines") before being checked against the approved-country list, instead of being rejected as unsupported due to the typo. Live and verified on both environments.
 - **2026-08-31** — `destinationCountry` on a travel request is now checked against an approved-country list maintained in SharePoint (see [Approved destination list](#approved-destination-list)) — a well-formed but unapproved country is now rejected and re-asked instead of accepted. Live and verified on both environments.
 - **2026-08-29** — Questions asking about the travel-request/helpdesk-ticket features themselves ("explain the travel request concept," "how to create a travel request," "what's required to create a travel request," "how to get a previous request") now route to `helpdesk` instead of being misrouted into starting the actual creation/lookup flow. Deployed to both environments.
 - **2026-08-28** — Deployed the current codebase to both the client-side Function App (`saunders-travel-classify-func`) and VeeLead's own Function App (`saunders-ai-agent-func`) for the first time in this project's history — everything in this changelog up to this point was only pushed to GitHub before today, not actually live on either environment. Both verified healthy afterward.

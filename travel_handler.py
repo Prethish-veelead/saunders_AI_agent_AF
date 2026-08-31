@@ -111,6 +111,10 @@ current year from today's date above — never guess a different year.
 message (e.g. "26 Aug 2026" and "26-Aug-2026" both become "2026-08-26").
 - If a date is ambiguous and purely numeric (e.g. "7-9-2026" or "7/9/2026"), \
 interpret it as DD-MM-YYYY (day before month) — never MM-DD-YYYY.
+- Normalize destinationCountry to its standard English name and spelling, \
+correcting obvious typos (e.g. "phillipines" -> "Philippines", "austrailia" \
+-> "Australia") — correct the spelling of the country that was mentioned, \
+never substitute a different country.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
 - If no destinations are mentioned, return an empty "legs" array."""
 
@@ -342,7 +346,10 @@ def _extract_followup_fields(
         "assume the current year from today's date above — never guess a "
         "different year. If a date is ambiguous and purely numeric (e.g. "
         '"7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY (day before '
-        "month) — never MM-DD-YYYY.\n"
+        "month) — never MM-DD-YYYY. Normalize destinationCountry to its "
+        'standard English name and spelling, correcting obvious typos (e.g. '
+        '"phillipines" -> "Philippines") — correct the spelling of the '
+        "country that was mentioned, never substitute a different country.\n"
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
         '  "destinationCountry": string or null,\n'
