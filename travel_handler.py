@@ -32,6 +32,10 @@ Design decisions (per current requirements):
      complete, a single missing reason is asked about once for all of
      them ("What's the reason for the trips?") rather than once per leg —
      the answer applies to every leg still missing it.
+  7. destinationCountry is checked against an approved-country list
+     fetched from SharePoint (see country_list.py) — a well-formed
+     country name that isn't on that list is rejected and re-asked,
+     same as the digit-guard above it.
 """
 
 import json
@@ -43,6 +47,8 @@ from typing import Any, Optional
 
 import requests
 from dateutil import parser as date_parser
+
+import country_list
 
 logger = logging.getLogger("travel_handler")
 
@@ -171,6 +177,8 @@ def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     country = leg.get("destinationCountry")
     if not country or any(ch.isdigit() for ch in country):
         return False
+    if not country_list.is_country_approved(country):
+        return False
     try:
         start_dt = date.fromisoformat(leg.get("startDate"))
     except (ValueError, TypeError):
@@ -231,6 +239,14 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
             return False, f"{i}.destinationCountry", (
                 f"\"{country}\" doesn't look like just a destination country — "
                 f"could you confirm just the country you're traveling to?"
+            )
+        if not country_list.is_country_approved(country):
+            # CountryListError (SharePoint/Graph unreachable or misconfigured)
+            # intentionally propagates out of here rather than being caught -
+            # a failed check must never be treated as "allow it".
+            return False, f"{i}.destinationCountry", (
+                f"Sorry, {country} isn't a country we currently support for "
+                f"travel requests — could you confirm a different destination?"
             )
 
         start_raw = leg.get("startDate")

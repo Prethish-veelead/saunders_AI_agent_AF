@@ -30,6 +30,7 @@ import azure.functions as func
 import requests
 
 from helpdesk_api_client import call_helpdesk_api, HelpdeskAPIConfigError, HelpdeskAPIError
+import country_list
 import query_handler
 import travel_handler
 
@@ -300,6 +301,12 @@ def handle_travel_request(
         return {
             "status": "error",
             "message": "Unable to process the travel request right now. Please retry.",
+        }
+    except country_list.CountryListError as exc:
+        logger.error("Approved-country list error: %s", exc)
+        return {
+            "status": "error",
+            "message": "Unable to verify the destination right now. Please retry.",
         }
     except ConfigurationError as exc:
         logger.error("Configuration error: %s", exc)
