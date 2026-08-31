@@ -252,6 +252,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-08-31** — Answering "Is that a travel request or a helpdesk ticket?" (or the equivalent record-type lookup question) with a typo (e.g. "helpdisk") now resolves correctly instead of silently re-asking the exact same question — both disambiguation checks were a hardcoded keyword match with no typo tolerance, unlike the rest of the system; both now use a small AI call instead. Live and verified on both environments.
 - **2026-08-31** — A pending travel request no longer silently absorbs an unrelated reply (e.g. a helpdesk complaint typed mid-flow) into the field it was waiting on. It's now checked against the pending question first; an unrelated reply gets a "you have a travel request in progress — finish it or refresh the chat" notice instead. Live and verified on both environments.
 - **2026-08-31** — An unsupported destination country is now flagged immediately when given, before asking for the reason or dates — previously the reason was asked first even when the destination was already known to be rejected. Live and verified on both environments.
 - **2026-08-31** — A misspelled destination country (e.g. "phillipines") is now corrected to its standard name ("Philippines") before being checked against the approved-country list, instead of being rejected as unsupported due to the typo. Live and verified on both environments.

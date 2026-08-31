@@ -206,17 +206,53 @@ def _wants_all(text: str) -> bool:
     return any(word in _SHOW_ALL_WORDS for word in words)
 
 
-def _classify_record_type_answer(answer_text: str) -> Optional[str]:
-    """Deterministic two-way match — no AI call needed for a binary choice
-    like this, unlike filter extraction which can mention any combination
-    of fields in free text.
+def _classify_record_type_answer(answer_text: str, config: dict[str, str]) -> Optional[str]:
+    """AI-based disambiguation of the answer to "which record type" — a
+    plain keyword match (the original approach here) has zero typo
+    tolerance, unlike every other classification in this system (e.g.
+    "helpdisk" wouldn't match "helpdesk"), and would silently re-ask the
+    same question forever instead of resolving a typo'd answer.
     """
-    lowered = answer_text.strip().lower()
-    if "travel" in lowered or "trip" in lowered:
-        return "travel_request"
-    if "ticket" in lowered or "helpdesk" in lowered or "help desk" in lowered or "help-desk" in lowered:
-        return "helpdesk_ticket"
-    return None
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        'The user was asked which kind of record they want to look up: a '
+        "travel request or a helpdesk ticket. Decide which one their reply "
+        "means, tolerating typos and casual phrasing. If the reply doesn't "
+        "clearly indicate either one, say so.\n\n"
+        'Respond ONLY with a JSON object: {"resolved": "travel_request" | '
+        '"helpdesk_ticket" | "unclear"}'
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": answer_text},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "response_format": {"type": "json_object"},
+    }
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise QueryExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (QueryExtractionError, json.JSONDecodeError) as exc:
+        logger.warning("Record-type disambiguation call failed, treating as unclear: %s", exc)
+        return None
+
+    resolved = parsed.get("resolved")
+    return resolved if resolved in RECORD_TYPES else None
 
 
 def _extract_filters_from_answer(
@@ -281,8 +317,9 @@ def process_query_request(
     """Main entry point called from function_app.py.
 
     - If `pending_request["missing_field"] == "record_type"`, `text` is the
-      answer to "travel request or helpdesk ticket" — classified
-      deterministically, no AI call needed.
+      answer to "travel request or helpdesk ticket" — classified via a
+      small scoped AI call so a typo'd answer (e.g. "helpdisk") still
+      resolves instead of silently re-asking the same question.
     - If `pending_request["missing_field"] == "filters"`, `text` is a
       free-text answer that may mention any combination of filters — runs
       a scoped AI extraction rather than guessing which single field it
@@ -297,7 +334,7 @@ def process_query_request(
     """
     if pending_request and pending_request.get("missing_field") == "record_type":
         extracted = pending_request.get("extracted") or {"record_type": None, "filters": {}}
-        record_type = _classify_record_type_answer(text)
+        record_type = _classify_record_type_answer(text, config)
         if record_type:
             extracted = {"record_type": record_type, "filters": _empty_filters(record_type)}
         # else: still unresolved — validate() below will re-ask.

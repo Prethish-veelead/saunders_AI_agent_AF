@@ -329,18 +329,56 @@ def handle_ambiguous_request(text: str) -> dict[str, Any]:
     }
 
 
-def _classify_ambiguous_request_answer(answer_text: str) -> Optional[str]:
-    """Deterministic two-way match — no AI call needed for a binary choice
-    like this (same pattern as query_handler's record-type disambiguation)."""
-    lowered = answer_text.strip().lower()
-    if "travel" in lowered or "trip" in lowered:
-        return "travel_request"
-    if "helpdesk" in lowered or "help desk" in lowered or "help-desk" in lowered or "ticket" in lowered:
-        return "helpdesk"
-    return None
+def _classify_ambiguous_request_answer(answer_text: str, config: dict[str, str]) -> Optional[str]:
+    """AI-based disambiguation of the answer to "travel request or helpdesk
+    ticket?" — a plain keyword match (the original approach here) has zero
+    typo tolerance, unlike every other classification in this system (e.g.
+    "helpdisk" wouldn't match "helpdesk"), and would silently re-ask the
+    same question forever instead of resolving a typo'd answer.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        'The user was asked: "Is that a travel request or a helpdesk '
+        'ticket?" Decide which one their reply means, tolerating typos and '
+        "casual phrasing. If the reply doesn't clearly indicate either "
+        "one, say so.\n\n"
+        'Respond ONLY with a JSON object: {"resolved": "travel_request" | '
+        '"helpdesk" | "unclear"}'
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": answer_text},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "response_format": {"type": "json_object"},
+    }
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, json.JSONDecodeError) as exc:
+        logger.warning("Ambiguous-request disambiguation call failed, treating as unclear: %s", exc)
+        return None
+
+    resolved = parsed.get("resolved")
+    return resolved if resolved in ("travel_request", "helpdesk") else None
 
 
-def resolve_ambiguous_request(text: str, pending_request: dict[str, Any]) -> dict[str, Any]:
+def resolve_ambiguous_request(text: str, pending_request: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
     """Follow-up: the user has now said travel or helpdesk. Routes into
     that category's normal handler using the ORIGINAL ambiguous message
     (which carried no extractable info of its own) rather than the
@@ -351,7 +389,7 @@ def resolve_ambiguous_request(text: str, pending_request: dict[str, Any]) -> dic
     the caller already knows the category before calling the others.
     """
     original_text = pending_request.get("original_text", text)
-    resolved = _classify_ambiguous_request_answer(text)
+    resolved = _classify_ambiguous_request_answer(text, config)
 
     if resolved == "travel_request":
         return {"belongto": "travel_request", **handle_travel_request(original_text)}
@@ -493,7 +531,7 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         if is_ambiguous_request_followup:
-            handler_result = resolve_ambiguous_request(text, previous_response)
+            handler_result = resolve_ambiguous_request(text, previous_response, config)
             response_payload = {"type": "fetch", **handler_result}
             logger.info("Resolved ambiguous create-request to '%s'.", handler_result.get("belongto"))
             return func.HttpResponse(
