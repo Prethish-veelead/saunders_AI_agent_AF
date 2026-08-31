@@ -155,7 +155,28 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'rule: "I want to travel to Cuba" (states personal intent to '
         'travel -> rule 3 below), "trip to meet a client" (personal '
         'intent, even with no destination given -> rule 3), "show my '
-        'tickets based on Cuba" (gives real search criteria -> rule 2).\n'
+        'tickets based on Cuba" (gives real search criteria -> rule 2). '
+        "However, stated intent PLUS an explicit question about HOW to "
+        'do it ("how do I do that", "how to do that", "how to apply", '
+        '"how to proceed") DOES match this rule despite naming a '
+        "destination or the person's own trip — the trailing process "
+        "question is the deciding signal, not whether a destination was "
+        'mentioned: "I want to travel to Cuba, how do I do that?", "I '
+        'want to travel to Cuba, how to apply?", "Ram wants to travel, '
+        'how and where can he apply?" -> "helpdesk" (rule 1), NOT rule '
+        '3 — contrast with the same intent stated with NO process '
+        'question at all ("I want to travel to Cuba" alone -> rule 3). '
+        "This also applies with NO topic named at all: a bare "
+        '"how"/"where" process question about raising/creating/applying '
+        'for "a request" — with no destination, no IT term, nothing — '
+        'still matches this rule, NOT rule 5: "how and where can I '
+        'raise a request", "how do I apply for a request", "where do I '
+        'go to submit a request" -> "helpdesk" (rule 1). The presence '
+        'of "how"/"where" asking about the PROCESS is what matters, not '
+        "whether a topic was named — contrast with rule 5's bare create "
+        'phrasing, which has NO "how"/"where" question at all (e.g. '
+        '"raise a request", "request needs to be raised" — a direct '
+        "attempt to create something now, not a question about how to).\n"
         "2. Does the message use a LOOKUP/retrieval verb or phrase — get, "
         'show, see, check, find, list, pull up, "what\'s the status of" '
         "— about a request or ticket that's implied to ALREADY exist? "
@@ -213,7 +234,12 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'needs to be raised", "can you create a request for me")? -> '
         '"ambiguous_request" — this is the ONLY case where you ask which '
         "topic they mean, and only because no topic word exists anywhere "
-        "in the message, never because details are missing.\n"
+        "in the message, never because details are missing. Excludes "
+        'anything containing a "how"/"where" process question (see rule '
+        "1's topic-less example) — those match rule 1 instead, even "
+        "with no topic named, because asking how/where to do it is a "
+        "process question, not an attempt to create something right "
+        "now.\n"
         '6. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"

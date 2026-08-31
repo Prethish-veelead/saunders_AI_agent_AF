@@ -45,6 +45,14 @@ Design decisions (per current requirements):
      no such check previously and would silently absorb any unrelated
      reply (e.g. a helpdesk complaint typed while a travel request was
      mid-flow) as if it were the answer.
+  9. reason is checked for being a legitimate BUSINESS reason (client
+     visit, conference, training, etc.) — this system only handles
+     business travel, not personal trips (a marriage proposal, a
+     vacation, visiting family for personal reasons). A personal reason
+     is rejected and re-asked, same pattern as the country-approval
+     check. Cached by normalized reason text (see
+     _business_reason_cache) since the judgment for a given reason never
+     changes and _validate() re-checks it on every subsequent turn.
 """
 
 import json
@@ -215,7 +223,73 @@ def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     return end_dt >= start_dt
 
 
-def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Optional[str]]:
+_business_reason_cache: dict[str, bool] = {}
+
+
+def _is_business_reason(reason: str, config: dict[str, str]) -> bool:
+    """Is this a legitimate BUSINESS travel reason, or something clearly
+    personal (a marriage proposal, a vacation, visiting family/friends for
+    personal reasons, a honeymoon, etc.)? This system only accepts business
+    travel requests. Cached by normalized reason text — the judgment for a
+    given reason never changes, and _validate() re-checks every leg's
+    reason on every subsequent turn, so this avoids repeating the same AI
+    call for a reason that's already been confirmed. Deliberately does NOT
+    fail open on an error (unlike TopicSwitch) — this is a policy gate
+    like the country-approval check, not just a UX nicety, so a
+    TravelExtractionError here propagates like any other extraction
+    failure rather than silently letting a personal reason through.
+    """
+    key = reason.strip().lower()
+    if key in _business_reason_cache:
+        return _business_reason_cache[key]
+
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "A corporate travel request system only accepts BUSINESS travel "
+        "reasons — client visits, conferences, meetings, work-related "
+        "training, site visits, business development, and similar. It "
+        "does NOT accept personal travel reasons — a marriage proposal, "
+        "a vacation, visiting family/friends for personal reasons, a "
+        "honeymoon, and similar.\n\n"
+        "Decide whether the given trip reason is a legitimate business "
+        "reason.\n\n"
+        'Respond ONLY with a JSON object: {"is_business": true or false}'
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": reason},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "response_format": {"type": "json_object"},
+    }
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    raw_output = _with_retries(_call)
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise TravelExtractionError(f"Business-reason check did not return valid JSON: {exc}") from exc
+
+    is_business = parsed.get("is_business") is not False
+    _business_reason_cache[key] = is_business
+    return is_business
+
+
+def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[bool, Optional[str], Optional[str]]:
     """Returns (is_complete, missing_field_path, follow_up_question).
 
     Checks each leg in turn and returns the FIRST problem found — we ask
@@ -225,7 +299,10 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
     list) FIRST, before anything else — no point asking for the reason or
     dates on a trip to a destination that's going to be rejected anyway.
     Once the destination is confirmed valid (or is absent), the usual
-    priority applies: reason, then destination, then dates.
+    priority applies: reason, then destination, then dates. A given reason
+    is checked for being a legitimate business reason right after the
+    "is it present" check — a personal reason (e.g. a marriage proposal)
+    is rejected and re-asked, same pattern as the destination checks.
 
     Exception: if every leg already has a valid destination/dates and 2+
     of them are missing only the reason, ask once for all of them
@@ -273,6 +350,12 @@ def _validate(extracted: list[dict[str, Any]]) -> tuple[bool, Optional[str], Opt
             if country:
                 return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
             return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
+        if not _is_business_reason(reason, config):
+            return False, f"{i}.reason", (
+                "Sorry, this system only accepts business travel requests — "
+                "could you provide the business reason for the trip"
+                f"{f' to {country}' if country else ''}?"
+            )
 
         if not country:
             if i == 0:
@@ -600,7 +683,7 @@ def process_travel_request(
     else:
         extracted = _extract_fields(text, config)
 
-    is_complete, missing_field_path, follow_up_question = _validate(extracted)
+    is_complete, missing_field_path, follow_up_question = _validate(extracted, config)
 
     if is_complete:
         return {"status": "complete", "extracted": extracted}
