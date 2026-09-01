@@ -101,7 +101,14 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
 Rules:
 - Today's date is {today}.
 - Set "record_type" to null if it's not clear which of the two they mean.
-  In that case "filters" must be {{}} (empty object).
+  In that case "filters" must be {{}} (empty object). A DATE ALONE is NOT
+  enough to decide — both record types have dates (dateRaised on both,
+  plus startDate/endDate on travel_request), so a date with no other
+  distinguishing detail (no destination, no travel word, no IT/ticket
+  word) must still result in null, not a guess: "show my request from
+  15 Oct 2026" and "check my request raised on 4 Aug" -> both null,
+  even though each names a date, because nothing in either message says
+  which record type it is.
 - If "record_type" is "travel_request", "filters" must have exactly these
   keys, each string or null: "destinationCountry", "startDate", "endDate",
   "dateRaised", "ticketId", "description".
@@ -332,12 +339,37 @@ def process_query_request(
       {"status": "incomplete", "extracted": {...}, "missing_field": "...",
        "follow_up_question": "..."}
     """
+    original_text = text
     if pending_request and pending_request.get("missing_field") == "record_type":
         extracted = pending_request.get("extracted") or {"record_type": None, "filters": {}}
+        original_text = pending_request.get("original_text", text)
         record_type = _classify_record_type_answer(text, config)
         if record_type:
-            extracted = {"record_type": record_type, "filters": _empty_filters(record_type)}
-        # else: still unresolved — validate() below will re-ask.
+            # The original message may have already stated a filter (a date,
+            # a keyword) that got dropped when record_type came back
+            # unresolved — extraction returns {} filters in that case, since
+            # the filter schema itself depends on which type it is. Now that
+            # the type is known, re-examine BOTH the original message and
+            # this disambiguation reply against that type's schema — the
+            # reply itself may also state a filter (e.g. "travel request,
+            # it's about Cuba"), not just answer which type it is — so
+            # nothing said in either message has to be repeated.
+            filters = _empty_filters(record_type)
+            combined_text = f"{original_text}. {text}" if text.strip() != original_text.strip() else original_text
+            try:
+                updates = _extract_filters_from_answer(record_type, filters, combined_text, config)
+                for key in FILTER_KEYS[record_type]:
+                    value = updates.get(key)
+                    if value:
+                        filters[key] = value
+            except QueryExtractionError as exc:
+                logger.warning(
+                    "Could not recover filters from the original message after "
+                    "resolving record_type; continuing with none recovered: %s", exc,
+                )
+            extracted = {"record_type": record_type, "filters": filters}
+        # else: still unresolved — validate() below will re-ask, with
+        # original_text carried forward in the response below.
 
     elif pending_request and pending_request.get("missing_field") == "filters":
         extracted = pending_request.get("extracted") or {"record_type": None, "filters": {}}
@@ -374,9 +406,14 @@ def process_query_request(
             "query": {"record_type": extracted["record_type"], "filters": extracted["filters"]},
         }
 
-    return {
+    result = {
         "status": "incomplete",
         "extracted": extracted,
         "missing_field": missing_field,
         "follow_up_question": follow_up_question,
     }
+    if missing_field == "record_type":
+        # Carried forward so a later turn can recover any filter the
+        # original message already stated, once record_type is known.
+        result["original_text"] = original_text
+    return result

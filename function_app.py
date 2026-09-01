@@ -239,7 +239,16 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "1's topic-less example) — those match rule 1 instead, even "
         "with no topic named, because asking how/where to do it is a "
         "process question, not an attempt to create something right "
-        "now.\n"
+        "now. That exclusion has its own limit, though: a question "
+        "asking WHICH topic/category applies to their own request — "
+        "not how the mechanics work — still belongs here at rule 5, "
+        'not rule 1: "I want to submit a request but I\'m not sure of '
+        'the correct category — could you advise?", "not sure if this '
+        'is a travel or helpdesk matter, can you help me figure out '
+        'which?" -> "ambiguous_request". Contrast with rule 1\'s "how '
+        'do I create a travel request" — that asks HOW the mechanics '
+        "work for an ALREADY-NAMED feature, not WHICH feature applies "
+        "to their situation.\n"
         '6. Otherwise -> "general_query".\n\n'
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
@@ -438,9 +447,12 @@ def _classify_ambiguous_request_answer(answer_text: str, config: dict[str, str])
 
 def resolve_ambiguous_request(text: str, pending_request: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
     """Follow-up: the user has now said travel or helpdesk. Routes into
-    that category's normal handler using the ORIGINAL ambiguous message
-    (which carried no extractable info of its own) rather than the
-    disambiguation answer itself.
+    that category's normal handler using BOTH the original ambiguous
+    message and this disambiguation reply — the reply itself may also
+    state real details (e.g. "travel request, I'm going to Cuba for a
+    client meeting" answers the question AND gives the destination/
+    reason), not just which category it is. Combining them means nothing
+    stated in either message has to be repeated.
 
     Unlike every other follow-up handler, this one returns "belongto"
     itself — which category this resolves to is only known here, whereas
@@ -448,11 +460,12 @@ def resolve_ambiguous_request(text: str, pending_request: dict[str, Any], config
     """
     original_text = pending_request.get("original_text", text)
     resolved = _classify_ambiguous_request_answer(text, config)
+    combined_text = f"{original_text}. {text}" if text.strip() != original_text.strip() else original_text
 
     if resolved == "travel_request":
-        return {"belongto": "travel_request", **handle_travel_request(original_text)}
+        return {"belongto": "travel_request", **handle_travel_request(combined_text)}
     if resolved == "helpdesk":
-        return {"belongto": "helpdesk", **handle_helpdesk_request(original_text)}
+        return {"belongto": "helpdesk", **handle_helpdesk_request(combined_text)}
 
     return {"belongto": "ambiguous_request", **handle_ambiguous_request(original_text)}
 
