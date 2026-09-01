@@ -133,7 +133,10 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
 Rules:
 - Today's date is {today}. If a date does not mention a year, assume the \
 current year from today's date above — never guess a different year.
-- Create one entry in "legs" for each distinct destination/trip mentioned in the message.
+- Create one entry in "legs" for each distinct trip mentioned in the message \
+— a trip counts even if it only states a reason or dates so far, with no \
+destination named yet; it does NOT need a destination specifically to count \
+as an entry.
 - Normalize every date to YYYY-MM-DD regardless of how it was written in the \
 message (e.g. "26 Aug 2026" and "26-Aug-2026" both become "2026-08-26").
 - If a date is ambiguous and purely numeric (e.g. "7-9-2026" or "7/9/2026"), \
@@ -143,7 +146,10 @@ correcting obvious typos (e.g. "phillipines" -> "Philippines", "austrailia" \
 -> "Australia") — correct the spelling of the country that was mentioned, \
 never substitute a different country.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
-- If no destinations are mentioned, return an empty "legs" array."""
+- Only return an empty "legs" array if the message states NO trip detail at \
+all — no destination, no dates, and no reason. If any one of those is \
+stated, create one leg entry with that detail filled in and the rest null, \
+even with no destination named."""
 
 
 def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
