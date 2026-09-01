@@ -141,7 +141,7 @@ Anything that doesn't fit the four categories above, including a lookup or IT/wo
 {
   "type": "new", "belongto": "general_query", "status": "complete",
   "question": "get my movie ticket to bahubali 2",
-  "message": "I'm not able to help with that — I can only assist with travel requests and helpdesk tickets. Please ask me something related to submitting or looking up one of those."
+  "follow_up_question": "I'm not able to help with that — I can only assist with travel requests and helpdesk tickets. Please ask me something related to submitting or looking up one of those."
 }
 ```
 

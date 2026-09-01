@@ -341,7 +341,7 @@ def handle_general_query(text: str) -> dict[str, Any]:
     return {
         "status": "complete",
         "question": text,
-        "message": (
+        "follow_up_question": (
             "I'm not able to help with that — I can only assist with "
             "travel requests and helpdesk tickets. Please ask me "
             "something related to submitting or looking up one of those."
