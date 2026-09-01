@@ -262,6 +262,14 @@ def _is_business_reason(reason: str, config: dict[str, str]) -> bool:
         "does NOT accept personal travel reasons — a marriage proposal, "
         "a vacation, visiting family/friends for personal reasons, a "
         "honeymoon, and similar.\n\n"
+        "A single generic word is still acceptable on its own, even with "
+        "no further detail — the later destination/date questions cover "
+        "specifics, this check only needs to rule out something CLEARLY "
+        'personal or meaningless: "travel", "trip", "business", '
+        '"meeting", "conference", "training", "work" are all acceptable '
+        "as-is, not rejected for being vague. Reject only when the "
+        "reason is clearly personal (a vacation, a proposal, visiting "
+        "family) — never merely because it's short or generic.\n\n"
         "Decide whether the given trip reason is a legitimate business "
         "reason.\n\n"
         'Respond ONLY with a JSON object: {"is_business": true or false}'
@@ -456,7 +464,13 @@ def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str
         "even if vague, partial, or oddly worded — or whether it clearly "
         "abandons the question and raises something unrelated instead (an "
         "IT/helpdesk problem, a request to look something up, or any other "
-        "unrelated topic).\n\n"
+        "unrelated topic). A short, generic word that plausibly relates to "
+        'the question\'s own subject IS an attempt to answer, not a switch '
+        '— e.g. replying "travel", "trip", or "training" to "what\'s the '
+        'reason for the trip?" is a vague but real answer (is_answer: '
+        'true), not a topic switch; only something that names a clearly '
+        "different subject (a helpdesk problem, an unrelated request) "
+        "counts as abandoning the question.\n\n"
         'Respond ONLY with a JSON object: {"is_answer": true or false}'
     )
     payload = {
