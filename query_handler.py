@@ -33,6 +33,8 @@ from typing import Any, Optional
 
 import requests
 
+import ai_client
+
 logger = logging.getLogger("query_handler")
 
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
@@ -108,7 +110,13 @@ Rules:
   word) must still result in null, not a guess: "show my request from
   15 Oct 2026" and "check my request raised on 4 Aug" -> both null,
   even though each names a date, because nothing in either message says
-  which record type it is.
+  which record type it is. The reverse also holds: if the message names
+  "travel request" or "helpdesk ticket" (or an obvious variant) ANYWHERE
+  in it, record_type is NOT ambiguous, no matter how much other filler
+  wording surrounds it — "first we can see travel request", "we can see
+  travel request", and "see the travel request" must ALL resolve to
+  "travel_request", the same as each other; extra words like "first" or
+  "we can" before the actual topic never make it unclear.
 - If "record_type" is "travel_request", "filters" must have exactly these
   keys, each string or null: "destinationCountry", "startDate", "endDate",
   "dateRaised", "ticketId", "description".
@@ -134,15 +142,15 @@ def _extract_query(text: str, config: dict[str, str]) -> dict[str, Any]:
         f"?api-version={AZURE_OPENAI_API_VERSION}"
     )
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": _build_extraction_system_prompt()},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 400,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=400,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -234,15 +242,15 @@ def _classify_record_type_answer(answer_text: str, config: dict[str, str]) -> Op
         'Respond ONLY with a JSON object: {"resolved": "travel_request" | '
         '"helpdesk_ticket" | "unclear"}'
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": answer_text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 20,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -291,15 +299,15 @@ def _extract_filters_from_answer(
         "Respond ONLY with a JSON object with exactly these keys, nothing else:\n"
         + json.dumps({key: "string or null" for key in keys})
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": answer_text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 300,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=300,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
