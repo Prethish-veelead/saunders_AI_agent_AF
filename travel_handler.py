@@ -547,7 +547,13 @@ def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str
         'reason for the trip?" is a vague but real answer (is_answer: '
         'true), not a topic switch; only something that names a clearly '
         "different subject (a helpdesk problem, an unrelated request) "
-        "counts as abandoning the question.\n\n"
+        "counts as abandoning the question. This also applies to a bare "
+        "personal-activity phrase with no connecting words — e.g. "
+        '"watch movie" answering "what\'s the reason for the trip?" IS an '
+        "attempt to answer (a personal, not business, reason — but still "
+        'an answer: is_answer true), the same as "to watch a movie" or '
+        '"watching a movie" would be; missing "to"/"a" doesn\'t make it a '
+        "topic switch.\n\n"
         'Respond ONLY with a JSON object: {"is_answer": true or false}'
     )
     payload = ai_client.build_chat_payload(
@@ -651,7 +657,10 @@ def _extract_followup_fields(
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _apply_answer_via_ai(leg: dict[str, Any], field: str, answer_text: str, config: dict[str, str]) -> None:
+def _apply_answer_via_ai(
+    leg: dict[str, Any], field: str, answer_text: str, config: dict[str, str],
+    already_confirmed_answer: bool = False,
+) -> None:
     try:
         updates = _extract_followup_fields(leg, field, answer_text, config)
     except TravelExtractionError as exc:
@@ -663,9 +672,19 @@ def _apply_answer_via_ai(leg: dict[str, Any], field: str, answer_text: str, conf
         leg[field] = answer_text
         return
 
-    if updates.get("is_topic_switch") and not any(updates.get(key) for key in _FOLLOWUP_FIELDS):
+    if (
+        updates.get("is_topic_switch")
+        and not any(updates.get(key) for key in _FOLLOWUP_FIELDS)
+        and not already_confirmed_answer
+    ):
         # Flagged as unrelated AND nothing usable was extracted from it —
         # a real (if messy) answer would have yielded at least one field.
+        # Skipped when the caller already ran the dedicated TopicSwitch
+        # check and it confirmed this IS a real answer attempt (e.g. a
+        # personal-but-stated reason like "watch movie") — that check's
+        # prompt is tuned specifically for this judgment call, and this
+        # extraction call's own is_topic_switch flag is secondary to it,
+        # not a second vote that can override it.
         raise TopicSwitch()
 
     for key in _FOLLOWUP_FIELDS:
@@ -688,12 +707,13 @@ def _apply_answer(
     answer_text = answer_text.strip()
     idx_str, field = missing_field_path.split(".")
 
-    # destinationCountry / reason: a plain-text answer with no digits would
-    # otherwise be trusted as-is with no validation at all — neither field
-    # ever legitimately needs a number, so there was never an AI call in
-    # this path to catch a reply that isn't actually an answer (e.g. a
-    # helpdesk complaint typed mid-flow). Checked once here, ahead of both
-    # the wildcard and single-leg branches below.
+    # destinationCountry / reason: a plain-text answer with no digits gets
+    # the TopicSwitch check (neither field ever legitimately needs a
+    # number) and is then routed through the scoped AI extraction below
+    # rather than trusted verbatim — TopicSwitch only confirms the reply
+    # is a real attempt to answer, not that the reply IS the value itself
+    # (e.g. "i want to travel to cuba" is a real answer, but "Cuba" — not
+    # the whole sentence — is the actual destination).
     trusts_directly = field in ("destinationCountry", "reason") and not any(ch.isdigit() for ch in answer_text)
     if trusts_directly and _is_topic_switch(follow_up_question, answer_text, config):
         raise TopicSwitch()
@@ -705,11 +725,6 @@ def _apply_answer(
         # answer, so fall back to the normal single-leg path (against the
         # first leg still missing it) rather than copying something
         # suspicious onto every leg at once.
-        if trusts_directly:
-            for leg in extracted:
-                if not leg.get(field):
-                    leg[field] = answer_text
-            return extracted
         idx = next((i for i, leg in enumerate(extracted) if not leg.get(field)), 0)
     else:
         idx = int(idx_str)
@@ -722,16 +737,36 @@ def _apply_answer(
         if parsed is not None:
             extracted[idx][field] = parsed
             return extracted
-    elif trusts_directly:
-        extracted[idx][field] = answer_text
+        _apply_answer_via_ai(extracted[idx], field, answer_text, config)
         return extracted
 
-    # The answer wasn't a clean fit for the field that was asked about — an
-    # unparseable/absent date, or a country/reason answer containing a
-    # number (almost always a sign it also states a date, e.g. "Cuba from
-    # 31-aug-2026 to 7-sep-2026" when only asked for the destination). Fall
-    # back to a scoped AI extraction instead of guessing or storing raw text
-    # that would just get rejected — and re-asked for verbatim — later.
+    if trusts_directly:
+        # Don't trust the reply verbatim, even though TopicSwitch already
+        # confirmed it's a real attempt to answer — it may be a full
+        # sentence containing the value rather than just the value itself
+        # (e.g. "i want to travel to cuba" answering "confirm a different
+        # destination?"), which would otherwise get stored as the literal
+        # destination string instead of "Cuba" being extracted from it.
+        # Extract properly instead, the same way fresh extraction would.
+        # already_confirmed_answer=True: the dedicated TopicSwitch check
+        # above already confirmed this is a real answer attempt, so this
+        # call's own (secondary, less-tuned) is_topic_switch flag must
+        # not override that and reject it a second time.
+        _apply_answer_via_ai(extracted[idx], field, answer_text, config, already_confirmed_answer=True)
+        if idx_str == "*":
+            value = extracted[idx].get(field)
+            if value:
+                for leg in extracted:
+                    if not leg.get(field):
+                        leg[field] = value
+        return extracted
+
+    # The answer wasn't a clean fit for the field that was asked about — a
+    # country/reason answer containing a number (almost always a sign it
+    # also states a date, e.g. "Cuba from 31-aug-2026 to 7-sep-2026" when
+    # only asked for the destination). Fall back to the same scoped AI
+    # extraction rather than guessing or storing raw text that would just
+    # get rejected — and re-asked for verbatim — later.
     _apply_answer_via_ai(extracted[idx], field, answer_text, config)
     return extracted
 
