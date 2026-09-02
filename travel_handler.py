@@ -456,6 +456,15 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                 f"could you confirm the correct start date?"
             )
 
+        start_time = leg.get("startTime")
+        if not start_time:
+            return False, f"{i}.startTime", f"What time do you depart on {start_raw}?"
+        if not _is_valid_hhmm(start_time):
+            return False, f"{i}.startTime", (
+                f"I couldn't understand the departure time for the trip to {country} — "
+                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
+            )
+
         end_raw = leg.get("endDate")
         if not end_raw:
             return False, f"{i}.endDate", f"What's the end date for the trip to {country}?"
@@ -470,15 +479,6 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
             return False, f"{i}.endDate", (
                 f"The end date for the trip to {country} is before the start date — "
                 f"could you confirm the correct end date?"
-            )
-
-        start_time = leg.get("startTime")
-        if not start_time:
-            return False, f"{i}.startTime", f"What time do you depart on {start_raw}?"
-        if not _is_valid_hhmm(start_time):
-            return False, f"{i}.startTime", (
-                f"I couldn't understand the departure time for the trip to {country} — "
-                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
             )
 
         end_time = leg.get("endTime")

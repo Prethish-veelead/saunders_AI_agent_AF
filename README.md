@@ -48,7 +48,7 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates, times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → end date → start time → end time**.
+Extracts one or more trip "legs" (destination, dates, times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → start time → end date → end time**.
 
 Single message, everything given:
 ```json
@@ -259,7 +259,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
-- **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked right after the dates, same one-field-at-a-time flow. Live and verified on both environments.
+- **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked in departure-then-return pairs — **start date → start time → end date → end time** — rather than both dates first, then both times. Live and verified on both environments.
 - **2026-09-02** — A full-sentence answer to a destination/reason follow-up question (e.g. "i want to travel to cuba" answering "could you confirm a different destination?") was getting stored as the destination verbatim — the whole sentence, not just "Cuba" — instead of extracting the actual value from it. Now properly extracts just the value the same way fresh extraction does, correcting spelling along the way. Live and verified on both environments.
 - **2026-09-02** — `general_query` no longer appears as an outcome — the classifier still detects it internally (unchanged), but it's now routed to the `helpdesk` handler instead of returning its polite refusal. An off-topic message (e.g. "book ticket for movie") now gets `"belongto": "helpdesk"` with no refusal text, identical in shape to a real helpdesk question. Deliberate, explicit direction — not a bug fix. Live on both environments.
 - **2026-09-02** — A typo'd trip reason (e.g. "cleint vist" for "client visit") could be wrongly rejected as not a legitimate business reason — the business-reason check didn't explicitly tolerate typos the way every other classification check in this system does. Added that instruction; verified on both environments.
