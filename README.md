@@ -30,6 +30,7 @@ The API is **stateless** — the Function App itself remembers nothing between c
 - **`"complete"`** — nothing more needed.
 - **`"incomplete"`** — the bot needs an answer to `follow_up_question` before it can finish.
 - **`"error"`** — something failed.
+- **`"cancelled"`** (`travel_request` only) — the user asked to cancel a request that was in progress; `message` explains it.
 
 **The contract for a caller:**
 1. When `status` comes back `"incomplete"`, show the user `follow_up_question` and save the **entire response object**.
@@ -37,7 +38,7 @@ The API is **stateless** — the Function App itself remembers nothing between c
    ```json
    { "text": "the user's reply", "previous_response": { ...the full previous response... } }
    ```
-3. When `status` comes back `"complete"` or `"error"`, clear the saved state — the next message starts fresh.
+3. When `status` comes back `"complete"`, `"error"`, or `"cancelled"`, clear the saved state — the next message starts fresh.
 
 Any client integrating with this API should check `status === "incomplete"` **generically** to decide whether to keep the conversation state — not check for one specific category. Three of the five categories currently use follow-up questions (`travel_request`, `query_request`, `ambiguous_request`), and hardcoding to just one of them silently breaks continuation for the others.
 

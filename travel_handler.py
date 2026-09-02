@@ -53,6 +53,12 @@ Design decisions (per current requirements):
      check. Cached by normalized reason text (see
      _business_reason_cache) since the judgment for a given reason never
      changes and _validate() re-checks it on every subsequent turn.
+  10. A reply to a pending follow-up question is checked for cancel
+     intent (see _is_cancel_intent) BEFORE anything else — "cancel",
+     "exit", "start over", "I don't want this", and similar all end the
+     in-progress request outright, rather than being mistaken for an
+     off-topic reply (TopicSwitch) or, worse, literally stored as the
+     answer to whichever field was being asked about.
 """
 
 import json
@@ -451,6 +457,63 @@ def _try_parse_clean_date(answer_text: str) -> Optional[str]:
     return parsed.date().isoformat()
 
 
+def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
+    """Does this reply express a clear intent to CANCEL/ABORT/STOP the
+    in-progress travel request entirely — not just decline to answer the
+    current question, but end the whole process? Checked before anything
+    else once a travel request is pending, so a cancellation short-
+    circuits the whole apply-answer/topic-switch pipeline instead of
+    being mistaken for an off-topic reply, or worse, literally stored as
+    the answer to whichever field was being asked about. Fails open
+    (treats as NOT a cancellation) if the check itself errors out — a
+    broken check must never block a legitimate answer.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "The user has a travel request in progress. Decide whether their "
+        "reply expresses a clear intent to CANCEL/ABORT/STOP the request "
+        "entirely — not merely decline to answer the current question, "
+        'but actually end the whole process. Words like "cancel", '
+        '"close", "exit", "quit", "abort", "discard", "discard request", '
+        '"start over", "don\'t continue", "I don\'t want this", or '
+        "similar all count, tolerating typos and casual phrasing. A "
+        "reply that attempts to answer the question, even vaguely, or "
+        "that raises an unrelated topic without asking to stop, does "
+        "NOT count.\n\n"
+        'Respond ONLY with a JSON object: {"is_cancel": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (TravelExtractionError, json.JSONDecodeError) as exc:
+        logger.warning("Cancel-intent check failed, treating as not a cancellation: %s", exc)
+        return False
+
+    return parsed.get("is_cancel") is True
+
+
 def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str, str]) -> bool:
     """Scoped, question-specific check used only for the fields that would
     otherwise be trusted with no validation at all (see _apply_answer).
@@ -691,8 +754,18 @@ def process_travel_request(
     or:
       {"status": "incomplete", "extracted": [...], "missing_field_path": "...",
        "follow_up_question": "..."}
+    or, if the user asked to cancel a pending request:
+      {"status": "cancelled", "message": "..."}
     """
     if pending_request and pending_request.get("missing_field_path"):
+        if _is_cancel_intent(text, config):
+            return {
+                "status": "cancelled",
+                "message": (
+                    "Your travel request has been cancelled. Let me know "
+                    "if you'd like to start a new one."
+                ),
+            }
         extracted = pending_request.get("extracted") or []
         try:
             extracted = _apply_answer(
