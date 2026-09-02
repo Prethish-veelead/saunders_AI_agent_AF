@@ -65,6 +65,7 @@ from typing import Any, Optional
 import requests
 from dateutil import parser as date_parser
 
+import ai_client
 import country_list
 
 logger = logging.getLogger("travel_handler")
@@ -146,6 +147,13 @@ correcting obvious typos (e.g. "phillipines" -> "Philippines", "austrailia" \
 -> "Australia") — correct the spelling of the country that was mentioned, \
 never substitute a different country.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
+- The words "travel"/"trip" used only to describe the ACT of traveling \
+(e.g. "I want to travel", "I need to take a trip", "raise a travel \
+request") do NOT by themselves state a reason — reason must name an \
+actual PURPOSE (a meeting, a conference, "business", a client visit, \
+etc.), not just repeat that the message is about travel. "I want to \
+travel" -> reason: null (no purpose given, only intent). "I want to \
+travel for business" -> reason: "business" (a purpose was given).
 - Only return an empty "legs" array if the message states NO trip detail at \
 all — no destination, no dates, and no reason. If any one of those is \
 stated, create one leg entry with that detail filled in and the rest null, \
@@ -159,15 +167,15 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
         f"?api-version={AZURE_OPENAI_API_VERSION}"
     )
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": _build_extraction_system_prompt()},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 800,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=800,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -277,15 +285,15 @@ def _is_business_reason(reason: str, config: dict[str, str]) -> bool:
         "reason.\n\n"
         'Respond ONLY with a JSON object: {"is_business": true or false}'
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": reason},
         ],
-        "temperature": 0.0,
-        "max_tokens": 20,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -476,15 +484,15 @@ def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str
         "counts as abandoning the question.\n\n"
         'Respond ONLY with a JSON object: {"is_answer": true or false}'
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": answer_text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 20,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -550,15 +558,15 @@ def _extract_followup_fields(
         '  "is_topic_switch": true or false\n'
         "}"
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": answer_text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 300,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=300,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
