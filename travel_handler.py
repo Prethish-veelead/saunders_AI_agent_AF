@@ -286,7 +286,10 @@ def _is_business_reason(reason: str, config: dict[str, str]) -> bool:
         '"meeting", "conference", "training", "work" are all acceptable '
         "as-is, not rejected for being vague. Reject only when the "
         "reason is clearly personal (a vacation, a proposal, visiting "
-        "family) — never merely because it's short or generic.\n\n"
+        "family) — never merely because it's short or generic. Tolerate "
+        "typos and casual phrasing when judging this — a misspelled "
+        'business reason (e.g. "cleint vist" for "client visit") is '
+        "still business, not a reason to reject it.\n\n"
         "Decide whether the given trip reason is a legitimate business "
         "reason.\n\n"
         'Respond ONLY with a JSON object: {"is_business": true or false}'
