@@ -48,15 +48,22 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → end date**.
+Extracts one or more trip "legs" (destination, dates, times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → end date → start time → end time**.
 
 Single message, everything given:
 ```json
 {
   "type": "new", "belongto": "travel_request", "status": "complete",
   "extracted": [
-    { "destinationCountry": "Cuba", "startDate": "2026-10-15", "endDate": "2026-10-20", "reason": "client visit" }
+    { "destinationCountry": "Cuba", "startDate": "2026-10-15", "endDate": "2026-10-20", "startTime": "09:30", "endTime": "18:00", "reason": "client visit" }
   ]
+}
+```
+
+**`startTime`/`endTime`** are always 24-hour `"HH:mm"` on the wire (`"09:30"`, `"18:00"`) regardless of how the user phrased it — `"9:30am"`, `"half nine"`, `"6 in the evening"` all normalize the same way dates do (natural phrasing in, ISO-style value out; any AM/PM display is a caller concern). A genuinely ambiguous time (`"at 7"`, `"sometime in the morning"`) comes back `null` and gets asked again rather than guessed — a malformed or still-ambiguous value is rejected the same way a malformed date is:
+```json
+{
+  "follow_up_question": "I couldn't understand the departure time for the trip to Cuba — could you confirm it (e.g. 9:30 AM or 18:00)?"
 }
 ```
 
@@ -252,6 +259,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked right after the dates, same one-field-at-a-time flow. Live and verified on both environments.
 - **2026-09-02** — A full-sentence answer to a destination/reason follow-up question (e.g. "i want to travel to cuba" answering "could you confirm a different destination?") was getting stored as the destination verbatim — the whole sentence, not just "Cuba" — instead of extracting the actual value from it. Now properly extracts just the value the same way fresh extraction does, correcting spelling along the way. Live and verified on both environments.
 - **2026-09-02** — `general_query` no longer appears as an outcome — the classifier still detects it internally (unchanged), but it's now routed to the `helpdesk` handler instead of returning its polite refusal. An off-topic message (e.g. "book ticket for movie") now gets `"belongto": "helpdesk"` with no refusal text, identical in shape to a real helpdesk question. Deliberate, explicit direction — not a bug fix. Live on both environments.
 - **2026-09-02** — A typo'd trip reason (e.g. "cleint vist" for "client visit") could be wrongly rejected as not a legitimate business reason — the business-reason check didn't explicitly tolerate typos the way every other classification check in this system does. Added that instruction; verified on both environments.

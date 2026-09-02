@@ -7,7 +7,12 @@ field-by-field form walk. No approver field — a request is "extracted" as a
 flat list of legs:
 
   [ { "destinationCountry": "...", "startDate": "YYYY-MM-DD",
-      "endDate": "YYYY-MM-DD", "reason": "..." }, ... ]
+      "endDate": "YYYY-MM-DD", "startTime": "HH:mm", "endTime": "HH:mm",
+      "reason": "..." }, ... ]
+
+startTime/endTime are wire-format 24-hour "HH:mm" values (e.g. "09:30",
+"18:00") — any AM/PM display is a caller concern, same split already used
+for dates (ISO on the wire, display-formatted on screen).
 
 Design decisions (per current requirements):
   1. One Azure OpenAI call extracts everything the message states — including
@@ -59,6 +64,17 @@ Design decisions (per current requirements):
      in-progress request outright, rather than being mistaken for an
      off-topic reply (TopicSwitch) or, worse, literally stored as the
      answer to whichever field was being asked about.
+  11. startTime/endTime are asked right after their corresponding date is
+     known (same leg, same priority slot dates occupy) and always go
+     through the AI extraction path rather than a deterministic parser —
+     unlike dates, spoken times ("half nine", "6 in the evening", "at
+     7") are too free-form for a library parser, and critically a
+     library would confidently guess at a genuinely ambiguous time
+     ("at 7" -> is that AM or PM?) instead of returning null the way
+     the extraction prompt is instructed to. A value that doesn't come
+     back as strict 24-hour HH:mm (including the raw text stored when
+     extraction is ambiguous — see _apply_answer_via_ai) fails the same
+     format check dates get and is re-asked.
 """
 
 import json
@@ -132,6 +148,8 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
       "destinationCountry": string or null,
       "startDate": string or null,
       "endDate": string or null,
+      "startTime": string or null,
+      "endTime": string or null,
       "reason": string or null
     }}
   ]
@@ -140,6 +158,15 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
 Rules:
 - Today's date is {today}. If a date does not mention a year, assume the \
 current year from today's date above — never guess a different year.
+- startTime/endTime are the departure/return times, always normalized to \
+24-hour "HH:mm" (e.g. "09:30", "18:00") no matter how the user phrased \
+them — "9:30am" -> "09:30", "half nine" (in the evening) -> "21:30", "6 in \
+the evening" -> "18:00", "6pm" -> "18:00", "noon" -> "12:00". If the time \
+is genuinely ambiguous — "at 7" with no AM/PM given, "sometime in the \
+morning", "in the afternoon" — use null rather than guessing; a wrong \
+guess is worse than asking again. A time mentioned with no date of its own \
+belongs to whichever leg's date it's next to / implied by — it never \
+creates a new leg on its own.
 - Create one entry in "legs" for each distinct trip mentioned in the message \
 — a trip counts even if it only states a reason or dates so far, with no \
 destination named yet; it does NOT need a destination specifically to count \
@@ -161,9 +188,9 @@ etc.), not just repeat that the message is about travel. "I want to \
 travel" -> reason: null (no purpose given, only intent). "I want to \
 travel for business" -> reason: "business" (a purpose was given).
 - Only return an empty "legs" array if the message states NO trip detail at \
-all — no destination, no dates, and no reason. If any one of those is \
-stated, create one leg entry with that detail filled in and the rest null, \
-even with no destination named."""
+all — no destination, no dates, no times, and no reason. If any one of \
+those is stated, create one leg entry with that detail filled in and the \
+rest null, even with no destination named."""
 
 
 def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
@@ -208,6 +235,8 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
             "destinationCountry": leg.get("destinationCountry"),
             "startDate": leg.get("startDate"),
             "endDate": leg.get("endDate"),
+            "startTime": leg.get("startTime"),
+            "endTime": leg.get("endTime"),
             "reason": leg.get("reason"),
         })
 
@@ -241,6 +270,21 @@ def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     except (ValueError, TypeError):
         return False
     return end_dt >= start_dt
+
+
+def _is_valid_hhmm(value: Any) -> bool:
+    """True only for a strict 24-hour "HH:mm" string (e.g. "09:30",
+    "18:00"). Used to catch both a malformed AI extraction and the raw
+    text _apply_answer_via_ai stores verbatim when a time answer was
+    genuinely ambiguous — either way, validation re-asks rather than
+    accepting something that isn't actually a clean 24-hour time.
+    """
+    if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
+        return False
+    hours, _, minutes = value.partition(":")
+    if not (hours.isdigit() and minutes.isdigit()):
+        return False
+    return 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59
 
 
 _business_reason_cache: dict[str, bool] = {}
@@ -328,7 +372,7 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
     Checks each leg in turn and returns the FIRST problem found — we ask
     one thing at a time. No approver field — travel requests only need
-    destination, dates, and reason per leg. A destination that was already
+    destination, dates, times, and reason per leg. A destination that was already
     given is checked for validity (digit-guard, then the approved-country
     list) FIRST, before anything else — no point asking for the reason or
     dates on a trip to a destination that's going to be rejected anyway.
@@ -428,6 +472,24 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                 f"could you confirm the correct end date?"
             )
 
+        start_time = leg.get("startTime")
+        if not start_time:
+            return False, f"{i}.startTime", f"What time do you depart on {start_raw}?"
+        if not _is_valid_hhmm(start_time):
+            return False, f"{i}.startTime", (
+                f"I couldn't understand the departure time for the trip to {country} — "
+                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
+            )
+
+        end_time = leg.get("endTime")
+        if not end_time:
+            return False, f"{i}.endTime", f"And what time do you expect to return on {end_raw}?"
+        if not _is_valid_hhmm(end_time):
+            return False, f"{i}.endTime", (
+                f"I couldn't understand the return time for the trip to {country} — "
+                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
+            )
+
     return True, None, None
 
 
@@ -438,7 +500,7 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
 _LEFTOVER_NOISE_CHARS = " ,.;:!?-"
 
-_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason")
+_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "startTime", "endTime", "reason")
 
 
 def _try_parse_clean_date(answer_text: str) -> Optional[str]:
@@ -616,6 +678,15 @@ def _extract_followup_fields(
         'standard English name and spelling, correcting obvious typos (e.g. '
         '"phillipines" -> "Philippines") — correct the spelling of the '
         "country that was mentioned, never substitute a different country. "
+        'startTime/endTime are always normalized to 24-hour "HH:mm" (e.g. '
+        '"09:30", "18:00") no matter how the user phrased them — "9:30am" '
+        '-> "09:30", "half nine" (in the evening) -> "21:30", "6 in the '
+        'evening" -> "18:00", "6pm" -> "18:00", "noon" -> "12:00". If the '
+        'time is genuinely ambiguous — "at 7" with no AM/PM given, '
+        '"sometime in the morning" — use null rather than guessing; a '
+        "wrong guess is worse than asking again. A bare time with no date "
+        "of its own (e.g. just \"9:30\") belongs to whichever of "
+        'startTime/endTime the question above was actually about. '
         'Also set "is_topic_switch" to true if the reply clearly abandons '
         "the question and raises something unrelated instead (an IT/"
         "helpdesk problem, a lookup request, or any other unrelated "
@@ -626,6 +697,8 @@ def _extract_followup_fields(
         '  "destinationCountry": string or null,\n'
         '  "startDate": string or null,\n'
         '  "endDate": string or null,\n'
+        '  "startTime": string or null,\n'
+        '  "endTime": string or null,\n'
         '  "reason": string or null,\n'
         '  "is_topic_switch": true or false\n'
         "}"
@@ -730,7 +803,10 @@ def _apply_answer(
         idx = int(idx_str)
 
     while len(extracted) <= idx:
-        extracted.append({"destinationCountry": None, "startDate": None, "endDate": None, "reason": None})
+        extracted.append({
+            "destinationCountry": None, "startDate": None, "endDate": None,
+            "startTime": None, "endTime": None, "reason": None,
+        })
 
     if field in ("startDate", "endDate"):
         parsed = _try_parse_clean_date(answer_text)
