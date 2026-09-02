@@ -13,10 +13,11 @@ A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns
 | Category | What it means | Example message |
 |---|---|---|
 | `travel_request` | Create a new trip | *"Business trip to Cuba with client, 26 Aug 2026 to 24 Sep 2026"* |
-| `helpdesk` | A new IT/workplace question | *"How do I reset my VPN password?"* |
+| `helpdesk` | A new IT/workplace question — also anything unrelated to travel/helpdesk (see note below) | *"How do I reset my VPN password?"*, *"get my movie ticket to bahubali 2"* |
 | `query_request` | Look up an existing travel request or helpdesk ticket | *"show my travel request to Cuba"*, *"list all the requests"* |
 | `ambiguous_request` | Wants to create/raise something, but doesn't say what kind | *"raise a request"* |
-| `general_query` | Anything unrelated to travel requests or helpdesk tickets | *"get my movie ticket to bahubali 2"*, *"what did I ask you yesterday?"* |
+
+> `general_query` — the catch-all for anything unrelated to travel/helpdesk — is still detected internally by the classifier, but as of 2026-09-02 is routed to the `helpdesk` handler rather than surfaced as its own outcome (see Changelog). It never appears in a live response's `belongto`.
 
 Classification is done by an Azure OpenAI (gpt-4o-mini) call. Everything after that — extracting the right details, validating them, deciding what to ask next — is deterministic code, not left to the model to improvise.
 
@@ -82,9 +83,9 @@ A message can also describe several trips at once — each becomes its own entry
 - A follow-up answer that gives more than the one thing asked (e.g. destination *and* both dates in one reply) is still fully captured — a smart fallback extracts everything relevant from the answer instead of only using the single field that was asked about.
 - Sanity checks run in code, not just trusted from the AI: a start date can't be in the past, an end date can't be before the start date, and a destination field that contains digits is rejected and re-asked (the AI occasionally folds a date into the destination field by mistake — this catches it every time).
 
-### `helpdesk` — a new IT/workplace question
+### `helpdesk` — a new IT/workplace question (also the catch-all)
 
-No extraction, no follow-up — the question is tagged and passed straight through. Answering it is owned by whatever consumes this response (a separate downstream system), not this Function App.
+No extraction, no follow-up — the question is tagged and passed straight through. Answering it is owned by whatever consumes this response (a separate downstream system), not this Function App. Since 2026-09-02 this also catches anything the classifier would otherwise call `general_query` (see the note above) — an off-topic message gets exactly this same shape, no refusal.
 ```json
 { "type": "new", "belongto": "helpdesk", "status": "complete", "question": "How do I reset my VPN password?" }
 ```
@@ -134,16 +135,9 @@ For messages like *"raise a request"* or *"request need to raise"* — a clear i
 
 **The distinction that matters:** a *lookup* verb (get/show/see/check/list/find — "get **my** request", "list all **the** requests") always means `query_request`, never this category — regardless of whether "my"/"the"/"all" is used. Only a genuinely *indefinite, topic-less* create phrasing ("**a** request", "**a** ticket") with a create verb (raise/create/open/submit/file) lands here. If the message names a topic anywhere — "travel"/"trip", a destination, dates, or an IT term like "VPN"/"password" — it's classified directly into `travel_request` or `helpdesk` instead, with no extra question asked.
 
-### `general_query` — true catch-all
+### `general_query` — internal-only, routed to `helpdesk`
 
-Anything that doesn't fit the four categories above, including a lookup or IT/workplace phrase that names a topic clearly outside travel or helpdesk (e.g. a movie ticket, a restaurant reservation) — those no longer get force-fit into `query_request`/`helpdesk` just because they use a lookup verb or contain the word "ticket". Returns a polite refusal steering the user back to travel/helpdesk topics; no history/memory logic exists yet — that would need a persistence layer and a stable per-user identifier, neither of which exist in this codebase currently.
-```json
-{
-  "type": "new", "belongto": "general_query", "status": "complete",
-  "question": "get my movie ticket to bahubali 2",
-  "follow_up_question": "I'm not able to help with that — I can only assist with travel requests and helpdesk tickets. Please ask me something related to submitting or looking up one of those."
-}
-```
+Anything that doesn't fit the categories above, including a lookup or IT/workplace phrase that names a topic clearly outside travel or helpdesk (e.g. a movie ticket, a restaurant reservation) — those don't get force-fit into `query_request`/`helpdesk` just because they use a lookup verb or contain the word "ticket" (see `query_request` above for that scoping). The classifier still detects this case, but as of 2026-09-02 the response no longer surfaces it as its own outcome — it's routed to the `helpdesk` handler instead (deliberate direction, not a bug). See the `helpdesk` section above for the response shape; there is no separate `general_query` response anymore.
 
 ---
 
@@ -247,8 +241,8 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 ## Known limitations
 
 - **No persistence layer.** Travel requests and helpdesk tickets are classified/extracted but never stored anywhere by this codebase. `query_request` returns filters to search by, not actual results — the real search/database lookup is owned by whatever system consumes this API.
-- **No cross-topic conversation memory.** State only persists within a single in-progress request (a travel request or query being filled in). `helpdesk` and `general_query` don't remember anything from earlier turns.
-- **`general_query` has no history/memory logic.** It returns a fixed polite refusal rather than a stub passthrough (see 2026-08-31 changelog), but there's still no actual history lookup or general-purpose answering — that would need a persistence layer and a stable per-user identifier, neither of which exist yet.
+- **No cross-topic conversation memory.** State only persists within a single in-progress request (a travel request or query being filled in). `helpdesk` doesn't remember anything from earlier turns.
+- **Off-topic messages are now indistinguishable from real helpdesk questions.** Since 2026-09-02, `general_query` (still detected internally) is routed to the `helpdesk` handler with no refusal — whatever consumes `helpdesk` responses downstream will now also receive things like movie-ticket requests or "tell me a joke", framed identically to a real IT question. No history/memory logic exists for either — that would need a persistence layer and a stable per-user identifier, neither of which exist yet.
 - **The two environments use different chat models.** The client's Function App is configured with `AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4o`; VeeLead's own is configured with `gpt-4o-mini`. Both work, but `gpt-4o-mini` is measurably less reliable at following the classifier's more detailed rules on edge-case phrasing (confirmed 2026-08-31: "raise a travel request" — rule 3's own example — consistently misclassified as `ambiguous_request` on the `gpt-4o-mini` deployment while classifying correctly every time on `gpt-4o`). If VeeLead's environment needs classification parity with the client's, switch its `AZURE_OPENAI_CHAT_DEPLOYMENT` setting to `gpt-4o` (cost/latency tradeoff to weigh first).
 
 ---
@@ -257,6 +251,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-02** — `general_query` no longer appears as an outcome — the classifier still detects it internally (unchanged), but it's now routed to the `helpdesk` handler instead of returning its polite refusal. An off-topic message (e.g. "book ticket for movie") now gets `"belongto": "helpdesk"` with no refusal text, identical in shape to a real helpdesk question. Deliberate, explicit direction — not a bug fix. Live on both environments.
 - **2026-09-02** — A lookup that explicitly names "travel request" or "helpdesk ticket" (e.g. "first we can see travel request") could still be asked "Is that a travel request or a helpdesk ticket?" if filler wording diluted the signal — it now reliably recognizes the named type regardless of surrounding phrasing. Live and verified on both environments.
 - **2026-09-02** — "I want to travel" (bare travel intent, no stated purpose) no longer gets the word "travel" itself extracted as the reason — it now correctly asks "What's the reason for your trip?" instead of skipping straight to destination. A message that does state a purpose (e.g. "I want to travel for business") still extracts it directly as before. Live and verified on both environments.
 - **2026-09-01** — The business-reason check now explicitly recognizes personal leisure/entertainment (watching a movie, a concert, a sporting event, shopping, sightseeing) as non-business, not just vacations/honeymoons/family visits — it previously only listed a few specific personal-reason examples and didn't reliably generalize to other clearly-personal activities. Live and verified on both environments.

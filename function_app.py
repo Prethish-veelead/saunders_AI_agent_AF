@@ -30,6 +30,7 @@ import azure.functions as func
 import requests
 
 from helpdesk_api_client import call_helpdesk_api, HelpdeskAPIConfigError, HelpdeskAPIError
+import ai_client
 import country_list
 import query_handler
 import travel_handler
@@ -259,15 +260,15 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "}"
     )
 
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 150,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=150,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -417,15 +418,15 @@ def _classify_ambiguous_request_answer(answer_text: str, config: dict[str, str])
         'Respond ONLY with a JSON object: {"resolved": "travel_request" | '
         '"helpdesk" | "unclear"}'
     )
-    payload = {
-        "messages": [
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": answer_text},
         ],
-        "temperature": 0.0,
-        "max_tokens": 20,
-        "response_format": {"type": "json_object"},
-    }
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
 
     def _call():
         resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -619,18 +620,27 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
 
         if classification["category"] == "travel_request":
             handler_result = handle_travel_request(text)
+            belongto = "travel_request"
         elif classification["category"] == "helpdesk":
             handler_result = handle_helpdesk_request(text)
+            belongto = "helpdesk"
         elif classification["category"] == "query_request":
             handler_result = handle_query_request(text)
+            belongto = "query_request"
         elif classification["category"] == "ambiguous_request":
             handler_result = handle_ambiguous_request(text)
+            belongto = "ambiguous_request"
         else:
-            handler_result = handle_general_query(text)
+            # general_query is still detected by the classifier (rule 6
+            # above) — kept, not deleted — but is no longer surfaced as
+            # its own outcome. Routed into the helpdesk handler instead
+            # of handle_general_query()'s refusal, per explicit direction.
+            handler_result = handle_helpdesk_request(text)
+            belongto = "helpdesk"
 
         response_payload = {
             "type": "new",
-            "belongto": classification["category"],
+            "belongto": belongto,
             **handler_result,
         }
 
