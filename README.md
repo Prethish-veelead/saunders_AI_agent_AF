@@ -48,7 +48,7 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates+times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date/time → end date/time**.
+Extracts one or more trip "legs" (destination, dates+times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, always in this fixed order: **reason → destination → start date/time → end date/time**.
 
 Single message, everything given:
 ```json
@@ -65,7 +65,7 @@ Single message, everything given:
 If a date is known but the time isn't yet, the follow-up asks specifically for the time rather than the whole question again:
 ```json
 {
-  "extracted": [ { "destinationCountry": "Cuba", "startDate": "2027-08-05", "endDate": null, "reason": null } ],
+  "extracted": [ { "destinationCountry": "Cuba", "startDate": "2027-08-05", "endDate": null, "reason": "client meeting" } ],
   "missing_field_path": "0.startDate",
   "follow_up_question": "What time on 5 Aug 2027 does the trip to Cuba start?"
 }
@@ -270,6 +270,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-03** — The travel-request follow-up order is now a fixed **reason → destination → start date/time → end date/time**, always — reverted from a brief same-day change that asked reason last. Live and verified on both environments.
 - **2026-09-03** — `startTime`/`endTime` are removed; `startDate`/`endDate` now each carry both the date and the time in one value (`"YYYY-MM-DDTHH:mm"`, naive wall-clock, e.g. `"2027-08-05T09:30"`), matching a UI change to one combined calendar+clock control per leg boundary instead of two separate ones. A date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value — `missing_field_path` stays on the same field (`0.startDate`/`0.endDate`) and the follow-up asks specifically for the time (*"What time on 5 Aug 2027 does the trip to Cuba start?"*) rather than repeating the whole question. Ambiguous-time-returns-null behavior is unchanged, just applied to this merged field — the date-only value is left untouched rather than guessed at. Live and verified on both environments.
 - **2026-09-03** — A message that just addresses/greets the helpdesk with no issue stated yet — "helpdesk", "hi helpdesk", "hello helpdesk team" — now gets a canned welcome reply asking the user to describe their issue, instead of being passed straight through as if "helpdesk" itself were the question. A message that also states a real issue (e.g. "helpdesk, my VPN isn't connecting") is unaffected — travel requests are also unaffected. Live and verified on both environments.
 - **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked in departure-then-return pairs — **start date → start time → end date → end time** — rather than both dates first, then both times. Live and verified on both environments.

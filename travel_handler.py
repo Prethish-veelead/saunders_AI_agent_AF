@@ -399,18 +399,12 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     """Returns (is_complete, missing_field_path, follow_up_question).
 
     Checks each leg in turn and returns the FIRST problem found — we ask
-    one thing at a time, in this order: destination, start date/time, end
-    date/time, reason. A destination that was already given is checked
-    for validity (digit-guard, then the approved-country list) FIRST,
-    before anything else — no point asking about dates or the reason for
-    a trip to a destination that's going to be rejected anyway. Reason is
-    asked LAST, after both boundaries are fully known (date and time) —
-    matches the caller's own question order, since the reason question
-    doesn't reference a date/destination the way the others do. A given
-    reason is checked for being a legitimate business reason right after
-    the "is it present" check — a personal reason (e.g. a marriage
-    proposal) is rejected and re-asked, same pattern as the destination
-    checks.
+    one thing at a time, ALWAYS in this fixed order: reason, destination,
+    start date/time, end date/time. Reason is asked first regardless of
+    what else is already known — a personal reason (e.g. a marriage
+    proposal) is rejected and re-asked (checked via _is_business_reason)
+    right after the "is it present" check, before destination or dates
+    are ever asked about.
 
     Exception: if every leg already has a valid destination/dates and 2+
     of them are missing only the reason, ask once for all of them
@@ -420,7 +414,7 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     would just make the user type the same answer twice.
     """
     if not extracted:
-        return False, "0.destinationCountry", "Where are you traveling to?"
+        return False, "0.reason", "What's the reason for your trip?"
 
     today = date.today()
 
@@ -431,6 +425,18 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
     for i, leg in enumerate(extracted):
         country = leg.get("destinationCountry")
+
+        reason = leg.get("reason")
+        if not reason:
+            if country:
+                return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
+            return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
+        if not _is_business_reason(reason, config):
+            return False, f"{i}.reason", (
+                "Sorry, this system only accepts business travel requests — "
+                "could you provide the business reason for the trip"
+                f"{f' to {country}' if country else ''}?"
+            )
 
         if country:
             if any(ch.isdigit() for ch in country):
@@ -500,16 +506,6 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
             return False, f"{i}.endDate", (
                 f"What time on {end_dt.day} {end_dt.strftime('%b %Y')} "
                 f"does the trip to {country} end?"
-            )
-
-        reason = leg.get("reason")
-        if not reason:
-            return False, f"{i}.reason", "What's the reason for the trip?"
-        if not _is_business_reason(reason, config):
-            return False, f"{i}.reason", (
-                "Sorry, this system only accepts business travel requests — "
-                "could you provide the business reason for the trip"
-                f"{f' to {country}' if country else ''}?"
             )
 
     return True, None, None
