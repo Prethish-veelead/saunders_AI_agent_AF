@@ -48,24 +48,29 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates, times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date → start time → end date → end time**.
+Extracts one or more trip "legs" (destination, dates+times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, in this order: **reason → destination → start date/time → end date/time**.
 
 Single message, everything given:
 ```json
 {
   "type": "new", "belongto": "travel_request", "status": "complete",
   "extracted": [
-    { "destinationCountry": "Cuba", "startDate": "2026-10-15", "endDate": "2026-10-20", "startTime": "09:30", "endTime": "18:00", "reason": "client visit" }
+    { "destinationCountry": "Cuba", "startDate": "2027-08-05T09:30", "endDate": "2027-08-06T18:00", "reason": "client meeting" }
   ]
 }
 ```
 
-**`startTime`/`endTime`** are always 24-hour `"HH:mm"` on the wire (`"09:30"`, `"18:00"`) regardless of how the user phrased it — `"9:30am"`, `"half nine"`, `"6 in the evening"` all normalize the same way dates do (natural phrasing in, ISO-style value out; any AM/PM display is a caller concern). A genuinely ambiguous time (`"at 7"`, `"sometime in the morning"`) comes back `null` and gets asked again rather than guessed — a malformed or still-ambiguous value is rejected the same way a malformed date is:
+**`startDate`/`endDate` carry both the date and time in one value**, one control (a calendar plus an AM/PM clock) and one question per leg boundary rather than two. `"YYYY-MM-DDTHH:mm"` — naive wall-clock, no offset, 24-hour time in the value (`"2027-08-05T09:30"`) — once both are known; a date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value, not an error. Spoken times normalize the same way regardless of phrasing — `"9:30am"`, `"half nine"`, `"6 in the evening"` all become 24-hour on the wire; any AM/PM display is a caller concern.
+
+If a date is known but the time isn't yet, the follow-up asks specifically for the time rather than the whole question again:
 ```json
 {
-  "follow_up_question": "I couldn't understand the departure time for the trip to Cuba — could you confirm it (e.g. 9:30 AM or 18:00)?"
+  "extracted": [ { "destinationCountry": "Cuba", "startDate": "2027-08-05", "endDate": null, "reason": null } ],
+  "missing_field_path": "0.startDate",
+  "follow_up_question": "What time on 5 Aug 2027 does the trip to Cuba start?"
 }
 ```
+A genuinely ambiguous time (`"at 7"`, `"sometime in the morning"`) leaves the date-only value untouched and asks again — it's never guessed. A time given with no date of its own (e.g. just `"9:30am"` answering the time-only re-ask above) is merged onto the date already held for that field.
 
 Missing details — follow-up question:
 ```json
@@ -77,7 +82,7 @@ Missing details — follow-up question:
 }
 ```
 
-A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about). **Exception:** if every leg already has a valid destination and dates and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
+A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about; a second or later leg's questions name its destination explicitly, e.g. *"When does the trip to Bangladesh start?"*, so a multi-destination itinerary can't be answered against the wrong leg). **Exception:** if every leg already has a valid destination and both dates/times and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
 
 **Destination is checked against an approved list**, not accepted freely — see [Approved destination list](#approved-destination-list) below. A well-formed but unapproved country is rejected the same way a malformed one is:
 ```json
@@ -87,8 +92,8 @@ A message can also describe several trips at once — each becomes its own entry
 ```
 
 **Reliability details worth knowing:**
-- Date phrasing is normalized to `YYYY-MM-DD` regardless of format (`26 Aug 2026`, `26-Aug-2026`, `2026-08-26` all work). Ambiguous all-numeric dates (`7-9-2026`) are read as day-first, not US month-first.
-- A follow-up answer that gives more than the one thing asked (e.g. destination *and* both dates in one reply) is still fully captured — a smart fallback extracts everything relevant from the answer instead of only using the single field that was asked about.
+- Date/time phrasing is normalized regardless of format (`26 Aug 2026`, `26-Aug-2026`, `2026-08-26`, `9:30am`, `half nine`, `6 in the evening` all work). Ambiguous all-numeric dates (`7-9-2026`) are read as day-first, not US month-first.
+- A follow-up answer that gives more than the one thing asked (e.g. destination *and* both start/end in one reply) is still fully captured — a scoped AI extraction pulls everything relevant from the answer instead of only using the single field that was asked about, and does so for every follow-up field (including date/time) rather than trusting a library parser, since a bare time-only reply could otherwise be misread as a brand new date.
 - Sanity checks run in code, not just trusted from the AI: a start date can't be in the past, an end date can't be before the start date, and a destination field that contains digits is rejected and re-asked (the AI occasionally folds a date into the destination field by mistake — this catches it every time).
 
 ### `helpdesk` — a new IT/workplace question (also the catch-all)
@@ -227,7 +232,7 @@ Everything below lives in one resource group so it's easy to find and, if ever n
 | `helpdesk_api_client.py` | Thin client for the third-party helpdesk search API, used only by the `/api/helpdesk-search` diagnostic endpoint. |
 | `helpdesk_search.py` | Superseded — an earlier SharePoint-based *helpdesk* search implementation, kept in the repo but not imported or used anywhere anymore. Not to be confused with `country_list.py`, which is a different, current SharePoint integration for a different purpose. |
 | `host.json` | Azure Functions host configuration (logging, extension bundle, timeout). |
-| `requirements.txt` | Python dependencies: `azure-functions`, `requests`, `python-dateutil`, `azure-identity`. |
+| `requirements.txt` | Python dependencies: `azure-functions`, `requests`, `azure-identity`. |
 | `local.settings.json.example` | Template for local configuration — copy to `local.settings.json` and fill in real values (never committed; see below). |
 
 ---
@@ -265,6 +270,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-03** — `startTime`/`endTime` are removed; `startDate`/`endDate` now each carry both the date and the time in one value (`"YYYY-MM-DDTHH:mm"`, naive wall-clock, e.g. `"2027-08-05T09:30"`), matching a UI change to one combined calendar+clock control per leg boundary instead of two separate ones. A date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value — `missing_field_path` stays on the same field (`0.startDate`/`0.endDate`) and the follow-up asks specifically for the time (*"What time on 5 Aug 2027 does the trip to Cuba start?"*) rather than repeating the whole question. Ambiguous-time-returns-null behavior is unchanged, just applied to this merged field — the date-only value is left untouched rather than guessed at. Live and verified on both environments.
 - **2026-09-03** — A message that just addresses/greets the helpdesk with no issue stated yet — "helpdesk", "hi helpdesk", "hello helpdesk team" — now gets a canned welcome reply asking the user to describe their issue, instead of being passed straight through as if "helpdesk" itself were the question. A message that also states a real issue (e.g. "helpdesk, my VPN isn't connecting") is unaffected — travel requests are also unaffected. Live and verified on both environments.
 - **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked in departure-then-return pairs — **start date → start time → end date → end time** — rather than both dates first, then both times. Live and verified on both environments.
 - **2026-09-02** — A full-sentence answer to a destination/reason follow-up question (e.g. "i want to travel to cuba" answering "could you confirm a different destination?") was getting stored as the destination verbatim — the whole sentence, not just "Cuba" — instead of extracting the actual value from it. Now properly extracts just the value the same way fresh extraction does, correcting spelling along the way. Live and verified on both environments.

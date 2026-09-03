@@ -6,13 +6,16 @@ Implements the travel_v1 schema as single-shot extraction rather than a
 field-by-field form walk. No approver field — a request is "extracted" as a
 flat list of legs:
 
-  [ { "destinationCountry": "...", "startDate": "YYYY-MM-DD",
-      "endDate": "YYYY-MM-DD", "startTime": "HH:mm", "endTime": "HH:mm",
-      "reason": "..." }, ... ]
+  [ { "destinationCountry": "...", "startDate": "YYYY-MM-DD" or
+      "YYYY-MM-DDTHH:mm", "endDate": same, "reason": "..." }, ... ]
 
-startTime/endTime are wire-format 24-hour "HH:mm" values (e.g. "09:30",
-"18:00") — any AM/PM display is a caller concern, same split already used
-for dates (ISO on the wire, display-formatted on screen).
+startDate/endDate carry date AND time together, one control/one question
+per leg boundary. "YYYY-MM-DDTHH:mm" (naive wall-clock, no offset, 24-hour
+time — e.g. "2027-08-05T09:30") once the time is known; plain "YYYY-MM-DD"
+is a legitimate, non-final value when only the date has been given so far
+— never invent a time to fill it in. Any AM/PM display is a caller
+concern, same split already used elsewhere (ISO on the wire,
+display-formatted on screen).
 
 Design decisions (per current requirements):
   1. One Azure OpenAI call extracts everything the message states — including
@@ -24,15 +27,17 @@ Design decisions (per current requirements):
   4. No server-side session. State is carried via the request/response
      round-trip: the caller resends the previous response as
      `pending_request` along with the answer to the single question that was
-     asked. Follow-up date answers are parsed deterministically (cheap, no
-     AI call) when they're a clean single value; if that fails — or the
-     answer clearly states more than the one field asked about (e.g. both
-     dates, or the reason, in the same reply) — a small scoped AI call
-     extracts whatever fields the answer actually mentions instead of
-     silently dropping the extra information or corrupting the field with
-     unparsed raw text.
-  5. Date sanity checks happen in code: endDate not before startDate,
-     startDate not before today.
+     asked. Every follow-up answer — including startDate/endDate — goes
+     through a small scoped AI call rather than a deterministic parser;
+     a library date/time parser would confidently misread a bare
+     time-only reply ("9:30am" answering "what time does it start?") as
+     a fresh date defaulting to today, which is exactly the kind of
+     false-confidence mistake the ambiguous-time rule below exists to
+     prevent. The AI call is given the leg's current known value for the
+     field being asked about, so it can merge a bare time onto an
+     already-known date instead of treating it as unrelated.
+  5. Date sanity checks happen in code: endDate (its date part) not
+     before startDate's, startDate not before today.
   6. If a message names multiple destinations and every leg is otherwise
      complete, a single missing reason is asked about once for all of
      them ("What's the reason for the trips?") rather than once per leg —
@@ -64,17 +69,18 @@ Design decisions (per current requirements):
      in-progress request outright, rather than being mistaken for an
      off-topic reply (TopicSwitch) or, worse, literally stored as the
      answer to whichever field was being asked about.
-  11. startTime/endTime are asked right after their corresponding date is
-     known (same leg, same priority slot dates occupy) and always go
-     through the AI extraction path rather than a deterministic parser —
-     unlike dates, spoken times ("half nine", "6 in the evening", "at
-     7") are too free-form for a library parser, and critically a
-     library would confidently guess at a genuinely ambiguous time
-     ("at 7" -> is that AM or PM?) instead of returning null the way
-     the extraction prompt is instructed to. A value that doesn't come
-     back as strict 24-hour HH:mm (including the raw text stored when
-     extraction is ambiguous — see _apply_answer_via_ai) fails the same
-     format check dates get and is re-asked.
+  11. startDate/endDate are asked about as ONE question each, covering
+     both the date and the time — "When does the trip to {country}
+     start? Please give the date and time." A date-only value
+     ("YYYY-MM-DD", no time) is a legitimate intermediate state, not an
+     error: _validate() re-asks specifically for the time ("What time on
+     5 Aug 2027 does the trip to Cuba start?") rather than the whole
+     question again. A time given with no date of its own (e.g. just
+     "9:30am" answering that time-only re-ask) is merged onto the date
+     already held for that field, never treated as unrelated or as a
+     new leg. A genuinely ambiguous time ("at 7" — AM or PM?) leaves the
+     date-only value untouched rather than inventing a time — see
+     _is_valid_hhmm and _parse_leg_moment.
 """
 
 import json
@@ -85,7 +91,6 @@ from datetime import date
 from typing import Any, Optional
 
 import requests
-from dateutil import parser as date_parser
 
 import ai_client
 import country_list
@@ -148,8 +153,6 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
       "destinationCountry": string or null,
       "startDate": string or null,
       "endDate": string or null,
-      "startTime": string or null,
-      "endTime": string or null,
       "reason": string or null
     }}
   ]
@@ -158,15 +161,18 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
 Rules:
 - Today's date is {today}. If a date does not mention a year, assume the \
 current year from today's date above — never guess a different year.
-- startTime/endTime are the departure/return times, always normalized to \
-24-hour "HH:mm" (e.g. "09:30", "18:00") no matter how the user phrased \
-them — "9:30am" -> "09:30", "half nine" (in the evening) -> "21:30", "6 in \
-the evening" -> "18:00", "6pm" -> "18:00", "noon" -> "12:00". If the time \
-is genuinely ambiguous — "at 7" with no AM/PM given, "sometime in the \
-morning", "in the afternoon" — use null rather than guessing; a wrong \
-guess is worse than asking again. A time mentioned with no date of its own \
-belongs to whichever leg's date it's next to / implied by — it never \
-creates a new leg on its own.
+- startDate/endDate each carry BOTH the date and the time of that leg \
+boundary in one value — "YYYY-MM-DDTHH:mm" (24-hour, e.g. "2027-08-05T09:30") \
+when both are known. If only the date was given, return just "YYYY-MM-DD" \
+— that's a legitimate value, NOT an error; never invent a time to fill it \
+in. If only a time is stated for a boundary whose date is given elsewhere \
+in the same message, attach it to that date rather than leaving it \
+unused. Normalize spoken times to 24-hour no matter how they were phrased \
+— "9:30am" -> "09:30", "half nine" (evening) -> "21:30", "6 in the \
+evening" / "6pm" -> "18:00", "noon" -> "12:00". If a time is genuinely \
+ambiguous — "at 7" with no AM/PM, "sometime in the morning" — omit the \
+time and return date-only (or null if there's no date either) rather than \
+guessing; a wrong guess is worse than asking again.
 - Create one entry in "legs" for each distinct trip mentioned in the message \
 — a trip counts even if it only states a reason or dates so far, with no \
 destination named yet; it does NOT need a destination specifically to count \
@@ -188,9 +194,9 @@ etc.), not just repeat that the message is about travel. "I want to \
 travel" -> reason: null (no purpose given, only intent). "I want to \
 travel for business" -> reason: "business" (a purpose was given).
 - Only return an empty "legs" array if the message states NO trip detail at \
-all — no destination, no dates, no times, and no reason. If any one of \
-those is stated, create one leg entry with that detail filled in and the \
-rest null, even with no destination named."""
+all — no destination, no dates/times, and no reason. If any one of those \
+is stated, create one leg entry with that detail filled in and the rest \
+null, even with no destination named."""
 
 
 def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
@@ -235,8 +241,6 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
             "destinationCountry": leg.get("destinationCountry"),
             "startDate": leg.get("startDate"),
             "endDate": leg.get("endDate"),
-            "startTime": leg.get("startTime"),
-            "endTime": leg.get("endTime"),
             "reason": leg.get("reason"),
         })
 
@@ -247,44 +251,68 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
 # Step 2 & 5: validation in code, including date sanity checks
 # --------------------------------------------------------------------------
 
-def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
-    """True if destinationCountry/startDate/endDate are all present and
-    valid for this leg — reason is checked separately. Mirrors the same
-    checks inline in _validate()'s per-leg loop below; kept as a separate
-    helper only for the multi-leg reason-batching pre-check, which needs a
-    yes/no answer rather than an early-return message.
-    """
-    country = leg.get("destinationCountry")
-    if not country or any(ch.isdigit() for ch in country):
-        return False
-    if not country_list.is_country_approved(country):
-        return False
-    try:
-        start_dt = date.fromisoformat(leg.get("startDate"))
-    except (ValueError, TypeError):
-        return False
-    if start_dt < today:
-        return False
-    try:
-        end_dt = date.fromisoformat(leg.get("endDate"))
-    except (ValueError, TypeError):
-        return False
-    return end_dt >= start_dt
-
-
-def _is_valid_hhmm(value: Any) -> bool:
+def _is_valid_hhmm(value: str) -> bool:
     """True only for a strict 24-hour "HH:mm" string (e.g. "09:30",
-    "18:00"). Used to catch both a malformed AI extraction and the raw
-    text _apply_answer_via_ai stores verbatim when a time answer was
-    genuinely ambiguous — either way, validation re-asks rather than
-    accepting something that isn't actually a clean 24-hour time.
-    """
+    "18:00")."""
     if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
         return False
     hours, _, minutes = value.partition(":")
     if not (hours.isdigit() and minutes.isdigit()):
         return False
     return 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59
+
+
+def _parse_leg_moment(value: Any) -> Optional[tuple[date, Optional[str]]]:
+    """Parses a combined startDate/endDate value into (date, time-or-None).
+    Accepts exactly "YYYY-MM-DD" (date-only — time not yet known, a
+    legitimate intermediate state) or "YYYY-MM-DDTHH:mm" (date and time
+    both known). Returns None for anything else — missing, malformed, or
+    the raw text _apply_answer_via_ai stores verbatim when an answer was
+    unusable — so callers can tell "date-only, ask for the time" apart
+    from "not a valid value at all, re-ask from scratch".
+    """
+    if not isinstance(value, str):
+        return None
+    if "T" in value:
+        date_part, _, time_part = value.partition("T")
+        if not _is_valid_hhmm(time_part):
+            return None
+        try:
+            return date.fromisoformat(date_part), time_part
+        except ValueError:
+            return None
+    try:
+        return date.fromisoformat(value), None
+    except ValueError:
+        return None
+
+
+def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
+    """True if destinationCountry/startDate/endDate are all present and
+    FULLY valid (date AND time) for this leg — reason is checked
+    separately. Mirrors the same checks inline in _validate()'s per-leg
+    loop below; kept as a separate helper only for the multi-leg
+    reason-batching pre-check, which needs a yes/no answer rather than an
+    early-return message. A date-only value (time not yet collected)
+    does NOT count as valid here — the batching heuristic only fires once
+    every leg is otherwise completely done.
+    """
+    country = leg.get("destinationCountry")
+    if not country or any(ch.isdigit() for ch in country):
+        return False
+    if not country_list.is_country_approved(country):
+        return False
+    parsed_start = _parse_leg_moment(leg.get("startDate"))
+    if parsed_start is None or parsed_start[1] is None:
+        return False
+    start_dt, _ = parsed_start
+    if start_dt < today:
+        return False
+    parsed_end = _parse_leg_moment(leg.get("endDate"))
+    if parsed_end is None or parsed_end[1] is None:
+        return False
+    end_dt, _ = parsed_end
+    return end_dt >= start_dt
 
 
 _business_reason_cache: dict[str, bool] = {}
@@ -371,16 +399,18 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     """Returns (is_complete, missing_field_path, follow_up_question).
 
     Checks each leg in turn and returns the FIRST problem found — we ask
-    one thing at a time. No approver field — travel requests only need
-    destination, dates, times, and reason per leg. A destination that was already
-    given is checked for validity (digit-guard, then the approved-country
-    list) FIRST, before anything else — no point asking for the reason or
-    dates on a trip to a destination that's going to be rejected anyway.
-    Once the destination is confirmed valid (or is absent), the usual
-    priority applies: reason, then destination, then dates. A given reason
-    is checked for being a legitimate business reason right after the
-    "is it present" check — a personal reason (e.g. a marriage proposal)
-    is rejected and re-asked, same pattern as the destination checks.
+    one thing at a time, in this order: destination, start date/time, end
+    date/time, reason. A destination that was already given is checked
+    for validity (digit-guard, then the approved-country list) FIRST,
+    before anything else — no point asking about dates or the reason for
+    a trip to a destination that's going to be rejected anyway. Reason is
+    asked LAST, after both boundaries are fully known (date and time) —
+    matches the caller's own question order, since the reason question
+    doesn't reference a date/destination the way the others do. A given
+    reason is checked for being a legitimate business reason right after
+    the "is it present" check — a personal reason (e.g. a marriage
+    proposal) is rejected and re-asked, same pattern as the destination
+    checks.
 
     Exception: if every leg already has a valid destination/dates and 2+
     of them are missing only the reason, ask once for all of them
@@ -390,7 +420,7 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     would just make the user type the same answer twice.
     """
     if not extracted:
-        return False, "0.reason", "What's the reason for your trip?"
+        return False, "0.destinationCountry", "Where are you traveling to?"
 
     today = date.today()
 
@@ -423,18 +453,6 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                     f"travel requests — could you confirm a different destination?"
                 )
 
-        reason = leg.get("reason")
-        if not reason:
-            if country:
-                return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
-            return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
-        if not _is_business_reason(reason, config):
-            return False, f"{i}.reason", (
-                "Sorry, this system only accepts business travel requests — "
-                "could you provide the business reason for the trip"
-                f"{f' to {country}' if country else ''}?"
-            )
-
         if not country:
             if i == 0:
                 return False, f"{i}.destinationCountry", "Where are you traveling to?"
@@ -442,84 +460,67 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
         start_raw = leg.get("startDate")
         if not start_raw:
-            return False, f"{i}.startDate", f"What's the start date for the trip to {country}?"
-        try:
-            start_dt = date.fromisoformat(start_raw)
-        except (ValueError, TypeError):
             return False, f"{i}.startDate", (
-                f"I couldn't understand the start date for the trip to {country} — "
+                f"When does the trip to {country} start? Please give the date and time."
+            )
+        parsed_start = _parse_leg_moment(start_raw)
+        if parsed_start is None:
+            return False, f"{i}.startDate", (
+                f"I couldn't understand the start date/time for the trip to {country} — "
                 f"could you confirm it?"
             )
+        start_dt, start_time = parsed_start
         if start_dt < today:
             return False, f"{i}.startDate", (
                 f"The start date for the trip to {country} is in the past — "
                 f"could you confirm the correct start date?"
             )
-
-        start_time = leg.get("startTime")
-        if not start_time:
-            return False, f"{i}.startTime", f"What time do you depart on {start_raw}?"
-        if not _is_valid_hhmm(start_time):
-            return False, f"{i}.startTime", (
-                f"I couldn't understand the departure time for the trip to {country} — "
-                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
+        if start_time is None:
+            return False, f"{i}.startDate", (
+                f"What time on {start_dt.day} {start_dt.strftime('%b %Y')} "
+                f"does the trip to {country} start?"
             )
 
         end_raw = leg.get("endDate")
         if not end_raw:
-            return False, f"{i}.endDate", f"What's the end date for the trip to {country}?"
-        try:
-            end_dt = date.fromisoformat(end_raw)
-        except (ValueError, TypeError):
+            return False, f"{i}.endDate", f"And when does the trip to {country} end?"
+        parsed_end = _parse_leg_moment(end_raw)
+        if parsed_end is None:
             return False, f"{i}.endDate", (
-                f"I couldn't understand the end date for the trip to {country} — "
+                f"I couldn't understand the end date/time for the trip to {country} — "
                 f"could you confirm it?"
             )
+        end_dt, end_time = parsed_end
         if end_dt < start_dt:
             return False, f"{i}.endDate", (
                 f"The end date for the trip to {country} is before the start date — "
                 f"could you confirm the correct end date?"
             )
+        if end_time is None:
+            return False, f"{i}.endDate", (
+                f"What time on {end_dt.day} {end_dt.strftime('%b %Y')} "
+                f"does the trip to {country} end?"
+            )
 
-        end_time = leg.get("endTime")
-        if not end_time:
-            return False, f"{i}.endTime", f"And what time do you expect to return on {end_raw}?"
-        if not _is_valid_hhmm(end_time):
-            return False, f"{i}.endTime", (
-                f"I couldn't understand the return time for the trip to {country} — "
-                f"could you confirm it (e.g. 9:30 AM or 18:00)?"
+        reason = leg.get("reason")
+        if not reason:
+            return False, f"{i}.reason", "What's the reason for the trip?"
+        if not _is_business_reason(reason, config):
+            return False, f"{i}.reason", (
+                "Sorry, this system only accepts business travel requests — "
+                "could you provide the business reason for the trip"
+                f"{f' to {country}' if country else ''}?"
             )
 
     return True, None, None
 
 
 # --------------------------------------------------------------------------
-# Step 4: stateless follow-up — apply one answer directly when it's a clean
-# single value; fall back to a scoped AI extraction when it isn't.
+# Step 4: stateless follow-up — every answer goes through a small scoped
+# AI extraction, given the leg's current known values for context.
 # --------------------------------------------------------------------------
 
-_LEFTOVER_NOISE_CHARS = " ,.;:!?-"
-
-_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "startTime", "endTime", "reason")
-
-
-def _try_parse_clean_date(answer_text: str) -> Optional[str]:
-    """Returns an ISO date string only if the answer is (essentially) just
-    a date with nothing meaningful left over. Returns None — rather than
-    guessing — if parsing fails outright, or leftover text suggests the
-    answer also states something else (another date, the reason, etc.).
-    """
-    try:
-        # dayfirst=True: an all-numeric date like "7-9-2026" is ambiguous,
-        # and dateutil otherwise defaults to US-style MM-DD-YYYY, silently
-        # swapping day and month from what the user meant.
-        parsed, leftover_tokens = date_parser.parse(answer_text, dayfirst=True, fuzzy_with_tokens=True)
-    except (ValueError, OverflowError, TypeError):
-        return None
-    leftover = "".join(leftover_tokens).strip(_LEFTOVER_NOISE_CHARS).strip()
-    if leftover:
-        return None
-    return parsed.date().isoformat()
+_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason")
 
 
 def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
@@ -648,10 +649,11 @@ def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str
 def _extract_followup_fields(
     leg: dict[str, Any], field: str, answer_text: str, config: dict[str, str]
 ) -> dict[str, Any]:
-    """Scoped fallback used only when the deterministic date parse can't
-    cleanly consume the answer on its own (e.g. it also states the reason,
-    or both dates at once). Extracts whatever fields the answer actually
-    states — never guesses at ones it doesn't mention.
+    """Scoped extraction for a single follow-up answer. Extracts whatever
+    fields the answer actually states — never guesses at ones it doesn't
+    mention. Given the leg's current known values so it can merge a
+    bare time onto a date already held for the field being asked about,
+    rather than treating the two as unrelated.
     """
     url = (
         f"{config['endpoint'].rstrip('/')}/openai/deployments/"
@@ -670,23 +672,32 @@ def _extract_followup_fields(
         "Extract any of the following fields the answer actually states. Use "
         "null for anything not mentioned — never guess, invent, or repeat an "
         "already-filled value unless the user is clearly correcting it. "
-        "Normalize any date to YYYY-MM-DD. If a date does not mention a year, "
-        "assume the current year from today's date above — never guess a "
-        "different year. If a date is ambiguous and purely numeric (e.g. "
-        '"7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY (day before '
-        "month) — never MM-DD-YYYY. Normalize destinationCountry to its "
-        'standard English name and spelling, correcting obvious typos (e.g. '
-        '"phillipines" -> "Philippines") — correct the spelling of the '
-        "country that was mentioned, never substitute a different country. "
-        'startTime/endTime are always normalized to 24-hour "HH:mm" (e.g. '
-        '"09:30", "18:00") no matter how the user phrased them — "9:30am" '
-        '-> "09:30", "half nine" (in the evening) -> "21:30", "6 in the '
-        'evening" -> "18:00", "6pm" -> "18:00", "noon" -> "12:00". If the '
-        'time is genuinely ambiguous — "at 7" with no AM/PM given, '
-        '"sometime in the morning" — use null rather than guessing; a '
-        "wrong guess is worse than asking again. A bare time with no date "
-        "of its own (e.g. just \"9:30\") belongs to whichever of "
-        'startTime/endTime the question above was actually about. '
+        "Normalize destinationCountry to its standard English name and "
+        'spelling, correcting obvious typos (e.g. "phillipines" -> '
+        '"Philippines") — correct the spelling of the country that was '
+        "mentioned, never substitute a different country.\n\n"
+        "startDate/endDate each carry BOTH the date and the time in one "
+        'value — "YYYY-MM-DDTHH:mm" (24-hour, e.g. "2027-08-05T09:30") once '
+        "both are known for that boundary. If a date does not mention a "
+        "year, assume the current year from today's date above — never "
+        "guess a different year. If a date is ambiguous and purely numeric "
+        '(e.g. "7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY (day '
+        "before month) — never MM-DD-YYYY. Normalize spoken times to "
+        '24-hour no matter how phrased — "9:30am" -> "09:30", "half nine" '
+        '(evening) -> "21:30", "6 in the evening" / "6pm" -> "18:00", '
+        '"noon" -> "12:00".\n\n'
+        f'The field being asked about ("{field}") may already hold a '
+        "date-only value (see current known trip details above) — if the "
+        "answer gives ONLY a time and no date of its own, combine that "
+        "time with the date ALREADY KNOWN for that same field to produce "
+        'the full "YYYY-MM-DDTHH:mm" value, rather than leaving it out or '
+        "treating it as unrelated. If the answer gives a date with no time "
+        'yet, return just "YYYY-MM-DD" — that\'s a legitimate value, not '
+        "an error, never invent a time to complete it. If a time is "
+        'genuinely ambiguous — "at 7" with no AM/PM given, "sometime in '
+        'the morning" — return null for that field so the date-only value '
+        "already held is left untouched and gets asked about again; a "
+        "wrong guess is worse than asking again.\n\n"
         'Also set "is_topic_switch" to true if the reply clearly abandons '
         "the question and raises something unrelated instead (an IT/"
         "helpdesk problem, a lookup request, or any other unrelated "
@@ -697,8 +708,6 @@ def _extract_followup_fields(
         '  "destinationCountry": string or null,\n'
         '  "startDate": string or null,\n'
         '  "endDate": string or null,\n'
-        '  "startTime": string or null,\n'
-        '  "endTime": string or null,\n'
         '  "reason": string or null,\n'
         '  "is_topic_switch": true or false\n'
         "}"
@@ -803,18 +812,7 @@ def _apply_answer(
         idx = int(idx_str)
 
     while len(extracted) <= idx:
-        extracted.append({
-            "destinationCountry": None, "startDate": None, "endDate": None,
-            "startTime": None, "endTime": None, "reason": None,
-        })
-
-    if field in ("startDate", "endDate"):
-        parsed = _try_parse_clean_date(answer_text)
-        if parsed is not None:
-            extracted[idx][field] = parsed
-            return extracted
-        _apply_answer_via_ai(extracted[idx], field, answer_text, config)
-        return extracted
+        extracted.append({"destinationCountry": None, "startDate": None, "endDate": None, "reason": None})
 
     if trusts_directly:
         # Don't trust the reply verbatim, even though TopicSwitch already
@@ -837,12 +835,14 @@ def _apply_answer(
                         leg[field] = value
         return extracted
 
-    # The answer wasn't a clean fit for the field that was asked about — a
-    # country/reason answer containing a number (almost always a sign it
-    # also states a date, e.g. "Cuba from 31-aug-2026 to 7-sep-2026" when
-    # only asked for the destination). Fall back to the same scoped AI
-    # extraction rather than guessing or storing raw text that would just
-    # get rejected — and re-asked for verbatim — later.
+    # Everything else — startDate/endDate always, plus a country/reason
+    # answer containing a number (almost always a sign it also states a
+    # date, e.g. "Cuba from 31-aug-2026 to 7-sep-2026" when only asked
+    # for the destination) — goes through the same scoped AI extraction.
+    # No deterministic fast path for dates: a bare time-only reply
+    # ("9:30am" answering a time-only re-ask) would otherwise be
+    # misparsed as today's date by a library parser instead of being
+    # merged onto the date already held for this field.
     _apply_answer_via_ai(extracted[idx], field, answer_text, config)
     return extracted
 
