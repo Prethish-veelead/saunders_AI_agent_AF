@@ -100,6 +100,12 @@ No extraction, no follow-up — the question is tagged and passed straight throu
 
 This also covers questions **about** the travel-request/query-request features themselves — *"explain the travel request concept"*, *"how do I create a travel request"*, *"what's required to create a travel request"*, *"how to get a previous request"*. These are requests for an explanation, not an attempt to actually create or look something up, so they land here rather than starting the travel-creation or lookup flow. A real action — *"I want to travel to Cuba"*, *"show my tickets based on Cuba"* — still routes to `travel_request`/`query_request` as normal; only messages phrased as a question about how the feature works get redirected here.
 
+**A bare greeting/address to the helpdesk with no issue stated** — *"helpdesk"*, *"hi helpdesk"*, *"hello helpdesk team"* — gets a canned welcome reply instead of being passed through as-is:
+```json
+{ "type": "new", "belongto": "helpdesk", "status": "complete", "question": "hi helpdesk", "message": "Hi! 👋 Welcome to the Helpdesk. I'm here to assist you.\n\nPlease let me know how I can help, and briefly explain the issue or trouble you're facing. I'll be happy to guide you through it." }
+```
+A message that also states a real issue (*"helpdesk, my VPN isn't connecting"*) is not treated as a greeting — it passes straight through as before, with no `message` field. This check is specific to `helpdesk` — a travel request is never affected by it.
+
 ### `query_request` — looking up something already submitted
 
 Classifies which record type is being looked up (`travel_request` or `helpdesk_ticket`) and extracts search filters from the message. **This only classifies and extracts — it does not perform the actual lookup.** There is no database or storage layer in this codebase for either record type; whatever consumes this response is responsible for running the real search against the returned filters.
@@ -259,6 +265,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-03** — A message that just addresses/greets the helpdesk with no issue stated yet — "helpdesk", "hi helpdesk", "hello helpdesk team" — now gets a canned welcome reply asking the user to describe their issue, instead of being passed straight through as if "helpdesk" itself were the question. A message that also states a real issue (e.g. "helpdesk, my VPN isn't connecting") is unaffected — travel requests are also unaffected. Live and verified on both environments.
 - **2026-09-02** — Travel requests now capture **departure/return time** per leg (`startTime`/`endTime`), alongside the existing dates. Always `"HH:mm"` 24-hour on the wire regardless of how the user phrased it ("9:30am", "half nine", "6 in the evening" all normalize the same way dates already do); a genuinely ambiguous time ("at 7") comes back `null` and is asked again rather than guessed. Asked in departure-then-return pairs — **start date → start time → end date → end time** — rather than both dates first, then both times. Live and verified on both environments.
 - **2026-09-02** — A full-sentence answer to a destination/reason follow-up question (e.g. "i want to travel to cuba" answering "could you confirm a different destination?") was getting stored as the destination verbatim — the whole sentence, not just "Cuba" — instead of extracting the actual value from it. Now properly extracts just the value the same way fresh extraction does, correcting spelling along the way. Live and verified on both environments.
 - **2026-09-02** — `general_query` no longer appears as an outcome — the classifier still detects it internally (unchanged), but it's now routed to the `helpdesk` handler instead of returning its polite refusal. An off-topic message (e.g. "book ticket for movie") now gets `"belongto": "helpdesk"` with no refusal text, identical in shape to a real helpdesk question. Deliberate, explicit direction — not a bug fix. Live on both environments.

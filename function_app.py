@@ -320,6 +320,72 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
 # Route handlers — STUBS to be filled in by the next two build-out steps
 # --------------------------------------------------------------------------
 
+HELPDESK_GREETING_MESSAGE = (
+    "Hi! \U0001F44B Welcome to the Helpdesk. I'm here to assist you.\n\n"
+    "Please let me know how I can help, and briefly explain the issue or "
+    "trouble you're facing. I'll be happy to guide you through it."
+)
+
+
+def _is_helpdesk_greeting(text: str, config: dict[str, str]) -> bool:
+    """True only when the message just addresses/greets the helpdesk —
+    "helpdesk", "hi helpdesk", "hello helpdesk team" — with no actual
+    issue, symptom, or question stated yet. A message that names a real
+    problem, even briefly (e.g. "helpdesk, my VPN isn't connecting"), is
+    NOT a greeting. Travel requests never go through this check — it's
+    only consulted for messages already classified as "helpdesk". Fails
+    open (treats it as a real question, not a greeting) if the check
+    itself errors out, same as every other AI-based check in this
+    system — a broken check must never swallow a real issue behind the
+    canned welcome message.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "A message was already classified as directed to an IT/workplace "
+        "helpdesk. Decide whether it is JUST a greeting or address to the "
+        "helpdesk itself, with NO actual issue, symptom, or question "
+        'stated yet — e.g. "helpdesk", "hi helpdesk", "hello helpdesk '
+        'team", "hey helpdesk, need some help" (still just an opener, no '
+        "specific issue named). Tolerate typos and casual phrasing "
+        '(e.g. "helpdsk", "hi helpdesk!!"). This is different from a real '
+        "request that happens to mention helpdesk but also states an "
+        'issue — those are NOT just a greeting: "helpdesk, my VPN isn\'t '
+        'connecting", "raise a helpdesk ticket for my printer", "hi, my '
+        'laptop won\'t turn on".\n\n'
+        'Respond ONLY with a JSON object: {"is_greeting_only": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, requests.RequestException, json.JSONDecodeError) as exc:
+        logger.warning("Helpdesk-greeting check failed, treating as a real question: %s", exc)
+        return False
+
+    return parsed.get("is_greeting_only") is True
+
+
 def handle_helpdesk_request(text: str) -> dict[str, Any]:
     """No API call, no search — help-desk questions are just tagged and
     passed through. Whatever consumes this response is responsible for
@@ -621,9 +687,6 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         if classification["category"] == "travel_request":
             handler_result = handle_travel_request(text)
             belongto = "travel_request"
-        elif classification["category"] == "helpdesk":
-            handler_result = handle_helpdesk_request(text)
-            belongto = "helpdesk"
         elif classification["category"] == "query_request":
             handler_result = handle_query_request(text)
             belongto = "query_request"
@@ -631,12 +694,24 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             handler_result = handle_ambiguous_request(text)
             belongto = "ambiguous_request"
         else:
-            # general_query is still detected by the classifier (rule 6
-            # above) — kept, not deleted — but is no longer surfaced as
-            # its own outcome. Routed into the helpdesk handler instead
-            # of handle_general_query()'s refusal, per explicit direction.
-            handler_result = handle_helpdesk_request(text)
+            # Both "helpdesk" and "general_query" land here. general_query
+            # is still detected by the classifier (rule 6 above) — kept,
+            # not deleted — but is no longer surfaced as its own outcome;
+            # it's routed into the helpdesk handler instead of
+            # handle_general_query()'s refusal, per explicit direction.
+            # Both get the same greeting check below, since a bare
+            # address to the helpdesk ("helpdesk", "hi helpdesk") can
+            # land in either bucket depending on phrasing, and both
+            # already end up as belongto "helpdesk".
             belongto = "helpdesk"
+            if _is_helpdesk_greeting(text, config):
+                handler_result = {
+                    "status": "complete",
+                    "question": text,
+                    "message": HELPDESK_GREETING_MESSAGE,
+                }
+            else:
+                handler_result = handle_helpdesk_request(text)
 
         response_payload = {
             "type": "new",
