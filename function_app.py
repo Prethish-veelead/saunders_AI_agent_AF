@@ -207,7 +207,18 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'travel request or helpdesk ticket: "get my movie ticket to '
         'bahubali 2", "show my concert tickets", "check my restaurant '
         'reservation" are NOT "query_request" (they fall through to rule '
-        '6, "general_query").\n'
+        '6, "general_query"). Contrast also with a lookup asking about '
+        "general REFERENCE or POLICY information — which countries are "
+        "approved/suspended for travel, a holiday calendar, expense "
+        "limits, IT policies — rather than a specific request/ticket the "
+        'user themselves submitted: "show suspended country", "show '
+        'approved country list", "list suspended countries", "what\'s the '
+        'holiday calendar" are NOT "query_request" either — there is no '
+        "personal record being looked up, just a reference question, so "
+        'these also fall through to rule 6, "general_query" (which '
+        "routes to helpdesk). Contrast with \"show my travel request to "
+        'Cuba" or "check my flight status", which DO name a specific '
+        "personal record and stay query_request.\n"
         '3. Does the message contain the word "travel" or "trip", a '
         "destination, or travel dates — ANYWHERE, even alongside a "
         'generic verb like "raise"/"create"/"open" (e.g. "raise a travel '
