@@ -69,6 +69,20 @@ Design decisions (per current requirements):
      in-progress request outright, rather than being mistaken for an
      off-topic reply (TopicSwitch) or, worse, literally stored as the
      answer to whichever field was being asked about.
+  11a. Country approval is checked in two steps: an exact (case-
+     insensitive) match against the approved list first; if that fails,
+     an AI call decides whether the name is a rewritten/reformatted
+     version of one of the list's entries rather than a genuinely
+     different destination — e.g. extraction's own "normalize to
+     standard English name" instruction rewriting the list's exact entry
+     "Gaza / Palestinian Territories" into "Palestinian Territories" or
+     "Palestine", which would otherwise fail a strict match even though
+     the user typed back exactly what the bot itself suggested. On a
+     match, the leg's destinationCountry is corrected to the list's exact
+     text. Cached by normalized input (see _country_match_cache), and —
+     like the business-reason check — does NOT fail open: a failed AI
+     call propagates as a system error rather than silently allowing an
+     unresolved country through.
   11. startDate/endDate are asked about as ONE question each, covering
      both the date and the time — "When does the trip to {country}
      start? Please give the date and time." A date-only value
@@ -315,6 +329,86 @@ def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     return end_dt >= start_dt
 
 
+_country_match_cache: dict[str, Optional[str]] = {}
+
+
+def _resolve_approved_country(country: str, config: dict[str, str]) -> Optional[str]:
+    """Returns the exact approved-list entry `country` refers to, or None
+    if it doesn't match any entry. Tries a cheap exact (case-insensitive)
+    match first; if that fails, asks the AI whether the name is a
+    rewritten/reformatted version of one of the list's entries — e.g.
+    extraction's own normalization turning the list's exact entry "Gaza /
+    Palestinian Territories" into "Palestinian Territories" or
+    "Palestine" — rather than assuming a genuinely different destination
+    was meant. Cached by normalized input text, since the same near-miss
+    name recurs across a conversation and the approved list rarely
+    changes within its own cache TTL. Deliberately does NOT fail open
+    (unlike TopicSwitch) — same policy-gate reasoning as
+    _is_business_reason: a TravelExtractionError here propagates like any
+    other extraction failure rather than silently letting an unresolved
+    country through.
+    """
+    key = country.strip().lower()
+    if key in _country_match_cache:
+        return _country_match_cache[key]
+
+    approved = country_list.get_approved_countries()
+    for entry in approved:
+        if key == entry.strip().lower():
+            _country_match_cache[key] = entry
+            return entry
+
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "A travel request names a destination country. Decide whether it "
+        "refers to one of the EXACT entries in the approved list below, "
+        "even if phrased, abbreviated, or reformatted differently — e.g. "
+        'a shortened or renamed version of a multi-part entry ("Gaza / '
+        'Palestinian Territories" said as just "Palestinian Territories" '
+        'or "Palestine" still refers to that same list entry). If it '
+        "clearly refers to one entry, respond with that entry's EXACT "
+        "text, copied verbatim from the list below — never a paraphrase "
+        "or a name not in the list. If it does not match any entry (a "
+        "genuinely different country), respond with null.\n\n"
+        f"Approved list:\n{json.dumps(approved)}\n\n"
+        'Respond ONLY with a JSON object: {"match": "<exact entry text "'
+        '"from the list>" or null}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": country},
+        ],
+        max_tokens=200,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    raw_output = _with_retries(_call)
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise TravelExtractionError(f"Country-match check did not return valid JSON: {exc}") from exc
+
+    match = parsed.get("match")
+    resolved = match if isinstance(match, str) and match in approved else None
+    _country_match_cache[key] = resolved
+    return resolved
+
+
 _business_reason_cache: dict[str, bool] = {}
 
 
@@ -447,15 +541,26 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                     f"\"{country}\" doesn't look like just a destination country — "
                     f"could you confirm just the country you're traveling to?"
                 )
-            if not country_list.is_country_approved(country):
-                # CountryListError (SharePoint/Graph unreachable or
-                # misconfigured) intentionally propagates out of here rather
-                # than being caught - a failed check must never be treated
-                # as "allow it".
+            # CountryListError (SharePoint/Graph unreachable or
+            # misconfigured) intentionally propagates out of here rather
+            # than being caught - a failed check must never be treated
+            # as "allow it".
+            resolved_country = _resolve_approved_country(country, config)
+            if resolved_country is None:
                 return False, f"{i}.destinationCountry", (
                     f"Sorry, {country} isn't a country we currently support for "
                     f"travel requests — could you confirm a different destination?"
                 )
+            if resolved_country != country:
+                # Extraction rewrote the list's exact entry into something
+                # that no longer matches it verbatim (e.g. "Gaza /
+                # Palestinian Territories" -> "Palestinian Territories")
+                # but _resolve_approved_country confirmed it's the same
+                # entry — correct it to the list's exact text so it's
+                # stored right and every later reference to {country}
+                # (dates, reason) uses the real name.
+                leg["destinationCountry"] = resolved_country
+                country = resolved_country
 
         reason = leg.get("reason")
         if not reason:
