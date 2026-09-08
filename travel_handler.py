@@ -399,12 +399,16 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     """Returns (is_complete, missing_field_path, follow_up_question).
 
     Checks each leg in turn and returns the FIRST problem found — we ask
-    one thing at a time, ALWAYS in this fixed order: reason, destination,
-    start date/time, end date/time. Reason is asked first regardless of
-    what else is already known — a personal reason (e.g. a marriage
-    proposal) is rejected and re-asked (checked via _is_business_reason)
-    right after the "is it present" check, before destination or dates
-    are ever asked about.
+    one thing at a time, in this fixed order: reason, destination, start
+    date/time, end date/time. Reason is asked first when destination is
+    still missing — same as every other not-yet-known field. The one
+    exception: a destination that was ALREADY stated is validated
+    (digit-guard, then the approved-country list) before reason is asked
+    about at all, so an invalid destination given up front is rejected
+    on the very first message rather than only after reason is answered.
+    A personal reason (e.g. a marriage proposal) is rejected and re-asked
+    (checked via _is_business_reason) right after the "is it present"
+    check.
 
     Exception: if every leg already has a valid destination/dates and 2+
     of them are missing only the reason, ask once for all of them
@@ -426,19 +430,13 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     for i, leg in enumerate(extracted):
         country = leg.get("destinationCountry")
 
-        reason = leg.get("reason")
-        if not reason:
-            if country:
-                return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
-            return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
-        if not _is_business_reason(reason, config):
-            return False, f"{i}.reason", (
-                "Sorry, this system only accepts business travel requests — "
-                "could you provide the business reason for the trip"
-                f"{f' to {country}' if country else ''}?"
-            )
-
         if country:
+            # A destination that was already stated is checked for validity
+            # BEFORE reason is ever asked about — no point asking for the
+            # reason on a trip to a destination that's going to be
+            # rejected anyway. This only applies when the destination is
+            # already known; if it isn't, reason is still asked first (see
+            # below), same as every other still-missing field.
             if any(ch.isdigit() for ch in country):
                 # Extraction occasionally folds dates/other fields into this
                 # one (e.g. "Cuba from 31-aug-2026 to 7-sep-2026") — no real
@@ -458,6 +456,18 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                     f"Sorry, {country} isn't a country we currently support for "
                     f"travel requests — could you confirm a different destination?"
                 )
+
+        reason = leg.get("reason")
+        if not reason:
+            if country:
+                return False, f"{i}.reason", f"What's the reason for the trip to {country}?"
+            return False, f"{i}.reason", f"What's the reason for trip #{i + 1}?"
+        if not _is_business_reason(reason, config):
+            return False, f"{i}.reason", (
+                "Sorry, this system only accepts business travel requests — "
+                "could you provide the business reason for the trip"
+                f"{f' to {country}' if country else ''}?"
+            )
 
         if not country:
             if i == 0:
