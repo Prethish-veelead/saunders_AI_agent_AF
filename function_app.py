@@ -186,13 +186,20 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         '(possessive), "the request" (definite article), "all the '
         'requests"/"all my requests"/"list all" (enumerating existing '
         'items) are ALL references to something already submitted — '
-        "NEVER something being created now. This only applies when the "
-        "request/ticket itself is either unqualified — no stated topic, "
-        'e.g. "my request", "my ticket" — always in scope by default — '
-        "or is plausibly a travel or IT/helpdesk matter specifically "
-        '(e.g. "travel request", "helpdesk ticket", "IT ticket", '
-        '"flight ticket"/"flight status" — travel-adjacent, in scope). '
-        'Examples, ALL "query_request": "get my request", "show my '
+        "NEVER something being created now. This only applies when what's "
+        "being looked up is itself a SUBMITTED item with a status to "
+        'check — a request/ticket left unqualified, e.g. "my request", '
+        '"my ticket" (always in scope by default), or a named item that '
+        'clearly IS one — "travel request", "helpdesk ticket", "IT '
+        'ticket", "flight ticket"/"flight status" (a booked flight is a '
+        "submitted item too). It does NOT apply just because the topic "
+        'is IT/hardware-FLAVORED — "get warranty details for my laptop", '
+        '"what\'s the warranty on my phone", "check my laptop specs" ask '
+        "for information about a personal item itself, not the status of "
+        "anything ever submitted, so they do NOT match this rule even "
+        'though "get"/"check" are lookup verbs and a laptop is hardware — '
+        "these fall through to rule 4 below (a plain IT/hardware "
+        'question) instead. Examples, ALL "query_request": "get my request", "show my '
         'request", "see my ticket", "get my request now", "list all the '
         'request", "check the request", "list all my requests", '
         '"what\'s the status of the request", "check my flight status", '

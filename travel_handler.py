@@ -376,8 +376,8 @@ def _resolve_approved_country(country: str, config: dict[str, str]) -> Optional[
         "or a name not in the list. If it does not match any entry (a "
         "genuinely different country), respond with null.\n\n"
         f"Approved list:\n{json.dumps(approved)}\n\n"
-        'Respond ONLY with a JSON object: {"match": "<exact entry text "'
-        '"from the list>" or null}'
+        'Respond ONLY with a JSON object: {"match": "<exact entry text '
+        'from the list>" or null}'
     )
     payload = ai_client.build_chat_payload(
         AZURE_OPENAI_CHAT_DEPLOYMENT,
