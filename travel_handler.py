@@ -7,7 +7,12 @@ field-by-field form walk. No approver field — a request is "extracted" as a
 flat list of legs:
 
   [ { "destinationCountry": "...", "startDate": "YYYY-MM-DD" or
-      "YYYY-MM-DDTHH:mm", "endDate": same, "reason": "..." }, ... ]
+      "YYYY-MM-DDTHH:mm", "endDate": same, "reason": "...",
+      "requestFor": "..." or null }, ... ]
+
+requestFor is null for the ordinary case — the requester is traveling
+themselves — and is never asked about unless the conversation itself
+signals otherwise. See design decision 12 below.
 
 startDate/endDate carry date AND time together, one control/one question
 per leg boundary. "YYYY-MM-DDTHH:mm" (naive wall-clock, no offset, 24-hour
@@ -95,6 +100,22 @@ Design decisions (per current requirements):
      new leg. A genuinely ambiguous time ("at 7" — AM or PM?) leaves the
      date-only value untouched rather than inventing a time — see
      _is_valid_hhmm and _parse_leg_moment.
+  12. requestFor captures a request being raised for someone other than
+     the requester — "for my manager", "on behalf of my friend", "for
+     John". It's extracted opportunistically wherever it's mentioned
+     (the first message, or buried inside a reply that was actually
+     answering something else — see _FOLLOWUP_FIELDS), never asked about
+     directly on its own. When requestFor is null (the overwhelming
+     majority of requests), NOTHING changes from the ordinary flow — no
+     extra question, no extra field to fill. It only produces a follow-up
+     question when the value extracted is a bare placeholder with no
+     actual identifying detail ("someone", "my manager", "him") — see
+     _is_vague_on_behalf_reference — in which case exactly ONE polite
+     question asks for a name or email; a name or email given anywhere,
+     including inline in the original message ("for John"), is accepted
+     immediately with no question at all. Checked FIRST — before reason,
+     before destination — establishing who the trip is actually for takes
+     priority over why or where, whenever it comes up at all.
 """
 
 import json
@@ -167,7 +188,8 @@ Respond ONLY with a JSON object matching this exact schema, nothing else:
       "destinationCountry": string or null,
       "startDate": string or null,
       "endDate": string or null,
-      "reason": string or null
+      "reason": string or null,
+      "requestFor": string or null
     }}
   ]
 }}
@@ -200,6 +222,15 @@ correcting obvious typos (e.g. "phillipines" -> "Philippines", "austrailia" \
 -> "Australia") — correct the spelling of the country that was mentioned, \
 never substitute a different country.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
+- requestFor: if the message indicates this trip is being arranged for \
+someone OTHER than the person sending the message — "for my manager", \
+"on behalf of my friend", "for John", "my colleague needs to travel", \
+"can I raise this for a team member" — set requestFor to a short \
+description of who it's for: their name if one was given (e.g. "John"), \
+otherwise the relation/word actually used (e.g. "my manager", "my \
+colleague", "someone"). If the message says nothing suggesting the trip \
+is for anyone other than the sender, leave requestFor null — this is the \
+default, ordinary case.
 - The words "travel"/"trip" used only to describe the ACT of traveling \
 (e.g. "I want to travel", "I need to take a trip", "raise a travel \
 request") do NOT by themselves state a reason — reason must name an \
@@ -208,9 +239,10 @@ etc.), not just repeat that the message is about travel. "I want to \
 travel" -> reason: null (no purpose given, only intent). "I want to \
 travel for business" -> reason: "business" (a purpose was given).
 - Only return an empty "legs" array if the message states NO trip detail at \
-all — no destination, no dates/times, and no reason. If any one of those \
-is stated, create one leg entry with that detail filled in and the rest \
-null, even with no destination named."""
+all — no destination, no dates/times, no reason, and no indication it's \
+for someone else. If any one of those is stated, create one leg entry \
+with that detail filled in and the rest null, even with no destination \
+named."""
 
 
 def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
@@ -256,6 +288,7 @@ def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
             "startDate": leg.get("startDate"),
             "endDate": leg.get("endDate"),
             "reason": leg.get("reason"),
+            "requestFor": leg.get("requestFor"),
         })
 
     return normalized_legs
@@ -274,6 +307,33 @@ def _is_valid_hhmm(value: str) -> bool:
     if not (hours.isdigit() and minutes.isdigit()):
         return False
     return 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59
+
+
+_VAGUE_ON_BEHALF_TERMS = {
+    "someone", "some one", "somebody", "some body", "another person", "other person",
+    "another employee", "colleague", "colleagues", "friend", "friends", "coworker",
+    "coworkers", "co-worker", "co-workers", "team member", "team members",
+    "manager", "managers", "boss", "employee", "employees", "staff member",
+    "staff members", "him", "her", "them", "someone else", "some one else",
+}
+
+
+def _is_vague_on_behalf_reference(value: str) -> bool:
+    """True if `value` (a leg's requestFor) names no actual person — just a
+    placeholder like "someone", "my manager", "one of my employees" — with
+    no name or email attached. Used to decide whether the one on-behalf-of
+    follow-up question is actually needed: a real name ("John") or an
+    email is accepted immediately with no question at all, but a bare
+    relation word isn't enough to identify who the trip is actually for.
+    """
+    if "@" in value:
+        return False
+    normalized = value.strip().lower()
+    for prefix in ("one of my ", "one of the ", "my ", "a ", "an ", "the "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    return normalized in _VAGUE_ON_BEHALF_TERMS
 
 
 def _parse_leg_moment(value: Any) -> Optional[tuple[date, Optional[str]]]:
@@ -493,12 +553,14 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     """Returns (is_complete, missing_field_path, follow_up_question).
 
     Checks each leg in turn and returns the FIRST problem found — we ask
-    one thing at a time, in this fixed order: reason, destination, start
-    date/time, end date/time. Reason is asked first when destination is
-    still missing — same as every other not-yet-known field. The one
+    one thing at a time, in this fixed order: requestFor (only if
+    triggered — see design decision 12), reason, destination, start
+    date/time, end date/time. Reason is asked when destination is still
+    missing — same as every other not-yet-known field. The one
     exception: a destination that was ALREADY stated is validated
-    (digit-guard, then the approved-country list) before reason is asked
-    about at all, so an invalid destination given up front is rejected
+    (digit-guard, then the approved-country list) before reason or
+    requestFor is asked about at all, so an invalid destination given up
+    front is rejected
     on the very first message rather than only after reason is answered.
     A personal reason (e.g. a marriage proposal) is rejected and re-asked
     (checked via _is_business_reason) right after the "is it present"
@@ -561,6 +623,20 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                 # (dates, reason) uses the real name.
                 leg["destinationCountry"] = resolved_country
                 country = resolved_country
+
+        request_for = leg.get("requestFor")
+        if request_for and _is_vague_on_behalf_reference(request_for):
+            # Something in the conversation signaled this trip is for
+            # someone else, but with no actual name or email attached
+            # ("someone", "my manager") — not enough to identify who to
+            # book it for. A real name or email given anywhere, including
+            # inline in the original message, skips this entirely — see
+            # design decision 12. Checked before reason: who the trip is
+            # for is established before why, when this comes up at all.
+            return False, f"{i}.requestFor", (
+                "Who is this travel request for? Could you share their "
+                "name or email address?"
+            )
 
         reason = leg.get("reason")
         if not reason:
@@ -631,7 +707,7 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 # AI extraction, given the leg's current known values for context.
 # --------------------------------------------------------------------------
 
-_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason")
+_FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason", "requestFor")
 
 
 def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
@@ -780,6 +856,14 @@ def _extract_followup_fields(
         f"Today's date is {today}.\n"
         f"Current known trip details (null means still missing): {json.dumps(leg)}\n"
         f'The question asked was about: "{field}"\n\n'
+        f'The message you are given below IS the user\'s direct reply to that '
+        f'question — it is new information, not a repeat of what\'s already '
+        f'known. If it states a value for "{field}", that value REPLACES '
+        f"whatever \"current known trip details\" above already shows for "
+        f'"{field}" (which may be empty, or may hold an earlier vague or '
+        f"incomplete value that this reply is specifically meant to "
+        f"resolve) — extract the NEW value from the reply itself, never "
+        f"echo back the old one.\n\n"
         "Extract any of the following fields the answer actually states. Use "
         "null for anything not mentioned — never guess, invent, or repeat an "
         "already-filled value unless the user is clearly correcting it. "
@@ -809,6 +893,18 @@ def _extract_followup_fields(
         'the morning" — return null for that field so the date-only value '
         "already held is left untouched and gets asked about again; a "
         "wrong guess is worse than asking again.\n\n"
+        "requestFor: if the answer indicates this trip is being arranged "
+        'for someone OTHER than the person replying — "for my manager", '
+        '"on behalf of my friend", "for John", "not me, for my friend", '
+        '"my colleague needs to travel" — set requestFor to a short '
+        'description of who it\'s for: their name if given (e.g. "John"), '
+        'otherwise the relation/word used (e.g. "my manager", "someone"). '
+        "This applies even when the question being asked was about a "
+        "completely different field (e.g. answering a destination "
+        'question with "japan, not me, for my friend" states BOTH the '
+        "destination AND requestFor — extract both). Leave requestFor "
+        "null if the answer says nothing suggesting the trip is for "
+        "anyone else.\n\n"
         'Also set "is_topic_switch" to true if the reply clearly abandons '
         "the question and raises something unrelated instead (an IT/"
         "helpdesk problem, a lookup request, or any other unrelated "
@@ -820,6 +916,7 @@ def _extract_followup_fields(
         '  "startDate": string or null,\n'
         '  "endDate": string or null,\n'
         '  "reason": string or null,\n'
+        '  "requestFor": string or null,\n'
         '  "is_topic_switch": true or false\n'
         "}"
     )
@@ -885,12 +982,35 @@ def _apply_answer_via_ai(
         if value:
             leg[key] = value
 
-    if not leg.get(field):
-        # The AI fallback didn't manage to fill the field that was actually
-        # asked about — keep the raw text there so validation re-prompts
-        # with a clear "couldn't understand" message instead of looping
-        # silently with no new information.
-        leg[field] = answer_text
+    if not updates.get(field):
+        if field in ("startDate", "endDate", "requestFor"):
+            # Deliberately leave the existing value untouched rather than
+            # overwrite it with raw, potentially unrelated text:
+            # - startDate/endDate: the ambiguous-time case (see
+            #   _extract_followup_fields) — extraction returns null on
+            #   purpose rather than invent a time, and the date-only value
+            #   already held must survive so the same clean re-ask goes
+            #   out again next turn.
+            # - requestFor: a reply that doesn't clearly identify a person
+            #   (e.g. it actually answers a DIFFERENT field, like stating
+            #   the reason instead) must not get stored as if it WERE a
+            #   resolved identity — that would silently corrupt the data
+            #   with garbage that happens to not match the vague-reference
+            #   stoplist. Keeping the existing (still-vague) value and
+            #   re-asking is safe; accepting anything at all is not.
+            pass
+        else:
+            # The AI didn't manage to extract this field from the answer.
+            # Store the raw text so the NEXT validation pass re-evaluates
+            # something fresh, rather than silently keeping whatever was
+            # already there — which matters whenever the field being asked
+            # about already held a value that's specifically why it's
+            # being re-asked (e.g. a reason/destination re-asked for
+            # having been rejected): without this, a failed extraction on
+            # the new answer would leave the old value in place forever,
+            # re-asking the same question on every subsequent turn with no
+            # way to progress.
+            leg[field] = answer_text
 
 
 def _apply_answer(
@@ -900,14 +1020,20 @@ def _apply_answer(
     answer_text = answer_text.strip()
     idx_str, field = missing_field_path.split(".")
 
-    # destinationCountry / reason: a plain-text answer with no digits gets
-    # the TopicSwitch check (neither field ever legitimately needs a
-    # number) and is then routed through the scoped AI extraction below
-    # rather than trusted verbatim — TopicSwitch only confirms the reply
-    # is a real attempt to answer, not that the reply IS the value itself
-    # (e.g. "i want to travel to cuba" is a real answer, but "Cuba" — not
-    # the whole sentence — is the actual destination).
-    trusts_directly = field in ("destinationCountry", "reason") and not any(ch.isdigit() for ch in answer_text)
+    # destinationCountry / reason / requestFor: a plain-text answer with no
+    # digits gets the TopicSwitch check (an email answering requestFor is
+    # the one legitimate exception that can contain digits, which simply
+    # skips this shortcut and falls to the generic AI-extraction path
+    # below instead — still handled correctly) and is then routed through
+    # the scoped AI extraction below rather than trusted verbatim —
+    # TopicSwitch only confirms the reply is a real attempt to answer, not
+    # that the reply IS the value itself (e.g. "i want to travel to cuba"
+    # is a real answer, but "Cuba" — not the whole sentence — is the
+    # actual destination).
+    trusts_directly = (
+        field in ("destinationCountry", "reason", "requestFor")
+        and not any(ch.isdigit() for ch in answer_text)
+    )
     if trusts_directly and _is_topic_switch(follow_up_question, answer_text, config):
         raise TopicSwitch()
 
@@ -923,7 +1049,10 @@ def _apply_answer(
         idx = int(idx_str)
 
     while len(extracted) <= idx:
-        extracted.append({"destinationCountry": None, "startDate": None, "endDate": None, "reason": None})
+        extracted.append({
+            "destinationCountry": None, "startDate": None, "endDate": None,
+            "reason": None, "requestFor": None,
+        })
 
     if trusts_directly:
         # Don't trust the reply verbatim, even though TopicSwitch already

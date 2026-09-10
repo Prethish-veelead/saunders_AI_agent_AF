@@ -48,17 +48,27 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates+times, reason) from the message in a single AI call — including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, always in this fixed order: **reason → destination → start date/time → end date/time**.
+Extracts one or more trip "legs" (destination, dates+times, reason, and — only when relevant — who the trip is for) from the message in a single AI call, including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, always in this fixed order: **requestFor (only if triggered) → reason → destination → start date/time → end date/time**.
 
 Single message, everything given:
 ```json
 {
   "type": "new", "belongto": "travel_request", "status": "complete",
   "extracted": [
-    { "destinationCountry": "Cuba", "startDate": "2027-08-05T09:30", "endDate": "2027-08-06T18:00", "reason": "client meeting" }
+    { "destinationCountry": "Cuba", "startDate": "2027-08-05T09:30", "endDate": "2027-08-06T18:00", "reason": "client meeting", "requestFor": null }
   ]
 }
 ```
+
+**`requestFor`** is `null` for the ordinary case — the requester is traveling themselves — and nothing about the flow changes: no extra field, no extra question, identical to before this existed. It's only populated when the conversation itself signals the trip is for someone else — "for my manager", "on behalf of my friend", "for John" — and this is recognized wherever it's mentioned, not just as the answer to a dedicated question (e.g. stating it while answering the destination question also works: *"cuba, not me, for my friend"* captures both `destinationCountry` and `requestFor` from the same reply). If what's captured is just a bare placeholder with no actual name or email ("someone", "my manager", "him"), exactly one follow-up question asks for a concrete identifier:
+```json
+{
+  "extracted": [ { "destinationCountry": null, "startDate": null, "endDate": null, "reason": null, "requestFor": "my manager" } ],
+  "missing_field_path": "0.requestFor",
+  "follow_up_question": "Who is this travel request for? Could you share their name or email address?"
+}
+```
+A real name or email given anywhere — including inline in the very first message ("for John") — is accepted immediately with no question at all.
 
 **`startDate`/`endDate` carry both the date and time in one value**, one control (a calendar plus an AM/PM clock) and one question per leg boundary rather than two. `"YYYY-MM-DDTHH:mm"` — naive wall-clock, no offset, 24-hour time in the value (`"2027-08-05T09:30"`) — once both are known; a date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value, not an error. Spoken times normalize the same way regardless of phrasing — `"9:30am"`, `"half nine"`, `"6 in the evening"` all become 24-hour on the wire; any AM/PM display is a caller concern.
 
@@ -72,7 +82,7 @@ If a date is known but the time isn't yet, the follow-up asks specifically for t
 ```
 A genuinely ambiguous time (`"at 7"`, `"sometime in the morning"`) leaves the date-only value untouched and asks again — it's never guessed. A time given with no date of its own (e.g. just `"9:30am"` answering the time-only re-ask above) is merged onto the date already held for that field.
 
-Missing details — follow-up question:
+Missing details, ordinary self-request — follow-up question:
 ```json
 {
   "type": "new", "belongto": "travel_request", "status": "incomplete",
@@ -87,7 +97,7 @@ A message can also describe several trips at once — each becomes its own entry
 **Destination is checked against an approved list**, not accepted freely — see [Approved destination list](#approved-destination-list) below. A well-formed but unapproved country is rejected the same way a malformed one is:
 ```json
 {
-  "follow_up_question": "Sorry, Germany isn't a country we currently support for travel requests — could you confirm a different destination?"
+  "follow_up_question": "Sorry, Vatican City isn't a country we currently support for travel requests — could you confirm a different destination?"
 }
 ```
 
@@ -270,6 +280,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-10** — Travel requests now support being raised on someone else's behalf. New field `requestFor` (null by default — the ordinary self-request case is completely unaffected) captures phrasing like "for my manager", "on behalf of my friend", "for John" wherever it's mentioned in the conversation, not just as the answer to a dedicated question. Checked FIRST, before reason — if what's captured is a bare placeholder with no name or email ("someone", "my manager"), exactly one question asks *"Who is this travel request for? Could you share their name or email address?"*; a real name or email given anywhere (including inline in the first message) skips the question entirely. Live and verified on both environments — 23/23 existing regression checks unaffected, 17/17 new scenario checks passing.
 - **2026-09-09** — The SharePoint approved-country list itself was expanded by its owner from 56 narrow entries to a full 195-country list — not a code change, but worth noting: Germany, Japan, France, and most other everyday destinations are now legitimately approved where they were rejected before. Confirmed the AI country-match fallback (added 2026-09-08) adapts automatically to renamed entries on the new list (e.g. "Burma" -> "Myanmar", "North Korea" -> "Korea (North)") with no code changes needed.
 - **2026-09-09** — Same misclassification pattern as "show suspended country" (below), a different trigger: a lookup verb next to an IT/hardware-flavored topic with no actual submitted ticket behind it — e.g. "can you get warranty details for my laptop" — was inconsistently routed to `query_request` instead of `helpdesk` (~4/5 of the time). The lookup rule now requires the thing being looked up to actually be a submitted request/ticket, not just an IT/hardware-adjacent noun — a plain hardware question now reaches the existing IT-topic rule and goes to `helpdesk` every time. Live and verified on both environments (10/10 consistent).
 - **2026-09-08** — General reference/policy questions with no personal record to look up — e.g. "show suspended country", "show approved country list" — were inconsistently classified: usually `query_request` (asking "Is that a travel request or a helpdesk ticket?", which doesn't make sense here since there's no actual record), occasionally `helpdesk` on the exact same input, a genuine model-level judgment-call inconsistency rather than a code bug. The classifier now explicitly excludes this kind of question from the lookup rule that leads to `query_request` — it's not a lookup of something the user submitted, just a reference question — so it routes to `helpdesk` every time instead. A real personal-record lookup ("show my travel request to Cuba", "check my flight status") is unaffected. Live and verified on both environments (10/10 consistent, was ~9/10 before).
