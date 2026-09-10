@@ -107,15 +107,23 @@ Design decisions (per current requirements):
      answering something else — see _FOLLOWUP_FIELDS), never asked about
      directly on its own. When requestFor is null (the overwhelming
      majority of requests), NOTHING changes from the ordinary flow — no
-     extra question, no extra field to fill. It only produces a follow-up
-     question when the value extracted is a bare placeholder with no
-     actual identifying detail ("someone", "my manager", "him") — see
-     _is_vague_on_behalf_reference — in which case exactly ONE polite
-     question asks for a name or email; a name or email given anywhere,
-     including inline in the original message ("for John"), is accepted
-     immediately with no question at all. Checked FIRST — before reason,
-     before destination — establishing who the trip is actually for takes
-     priority over why or where, whenever it comes up at all.
+     extra question, no extra field to fill. Once triggered, an actual
+     EMAIL address is always required to consider it resolved — a bare
+     name or relation ("John", "my manager") isn't enough on its own to
+     uniquely identify who to book the trip for, so it's followed by one
+     more targeted question asking specifically for the email
+     ("Could you share John's email address?") rather than the broad
+     one repeating itself. An email given anywhere, including inline in
+     the original message ("for john@company.com"), is accepted
+     immediately with no question at all — see _is_vague_on_behalf_reference
+     for the broad case and the deterministic "@" shortcut in
+     _apply_answer for resolving the email once asked (an email reply is
+     never routed through the AI extraction path — a bare email with no
+     surrounding words is exactly the kind of reply that's easy for a
+     model to fail to parse, so this is handled in code instead).
+     Checked FIRST — before reason, before destination — establishing
+     who the trip is actually for takes priority over why or where,
+     whenever it comes up at all.
 """
 
 import json
@@ -224,13 +232,15 @@ never substitute a different country.
 - If a field is not mentioned at all, use null. Never guess or invent a value.
 - requestFor: if the message indicates this trip is being arranged for \
 someone OTHER than the person sending the message — "for my manager", \
-"on behalf of my friend", "for John", "my colleague needs to travel", \
-"can I raise this for a team member" — set requestFor to a short \
-description of who it's for: their name if one was given (e.g. "John"), \
-otherwise the relation/word actually used (e.g. "my manager", "my \
-colleague", "someone"). If the message says nothing suggesting the trip \
-is for anyone other than the sender, leave requestFor null — this is the \
-default, ordinary case.
+"on behalf of my friend", "for John", "for john@company.com", "my \
+colleague needs to travel", "can I raise this for a team member" — set \
+requestFor to identify who it's for: an email address EXACTLY as written \
+if one was given (e.g. "john@company.com" -> "john@company.com" — never \
+shorten it to a guessed name like "John"), otherwise their name if one \
+was given (e.g. "John"), otherwise the relation/word actually used (e.g. \
+"my manager", "my colleague", "someone"). If the message says nothing \
+suggesting the trip is for anyone other than the sender, leave \
+requestFor null — this is the default, ordinary case.
 - The words "travel"/"trip" used only to describe the ACT of traveling \
 (e.g. "I want to travel", "I need to take a trip", "raise a travel \
 request") do NOT by themselves state a reason — reason must name an \
@@ -625,17 +635,22 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
                 country = resolved_country
 
         request_for = leg.get("requestFor")
-        if request_for and _is_vague_on_behalf_reference(request_for):
-            # Something in the conversation signaled this trip is for
-            # someone else, but with no actual name or email attached
-            # ("someone", "my manager") — not enough to identify who to
-            # book it for. A real name or email given anywhere, including
-            # inline in the original message, skips this entirely — see
-            # design decision 12. Checked before reason: who the trip is
+        if request_for and "@" not in request_for:
+            # An email is always required once the conversation signals
+            # this trip is for someone else — a name or relation alone
+            # ("John", "my manager") isn't enough to uniquely identify
+            # who to book it for. Checked before reason: who the trip is
             # for is established before why, when this comes up at all.
+            if _is_vague_on_behalf_reference(request_for):
+                # No name or relation was even given — ask broadly.
+                return False, f"{i}.requestFor", (
+                    "Who is this travel request for? Could you share their "
+                    "name or email address?"
+                )
+            # A name (or similar) is already known — ask specifically for
+            # the email rather than repeat the same broad question.
             return False, f"{i}.requestFor", (
-                "Who is this travel request for? Could you share their "
-                "name or email address?"
+                f"Could you share {request_for}'s email address?"
             )
 
         reason = leg.get("reason")
@@ -895,10 +910,13 @@ def _extract_followup_fields(
         "wrong guess is worse than asking again.\n\n"
         "requestFor: if the answer indicates this trip is being arranged "
         'for someone OTHER than the person replying — "for my manager", '
-        '"on behalf of my friend", "for John", "not me, for my friend", '
-        '"my colleague needs to travel" — set requestFor to a short '
-        'description of who it\'s for: their name if given (e.g. "John"), '
-        'otherwise the relation/word used (e.g. "my manager", "someone"). '
+        '"on behalf of my friend", "for John", "for john@company.com", '
+        '"not me, for my friend", "my colleague needs to travel" — set '
+        "requestFor to identify who it's for: an email address EXACTLY "
+        'as written if one was given (e.g. "john@company.com" -> '
+        '"john@company.com" — never shorten it to a guessed name like '
+        '"John"), otherwise their name if given (e.g. "John"), otherwise '
+        'the relation/word used (e.g. "my manager", "someone"). '
         "This applies even when the question being asked was about a "
         "completely different field (e.g. answering a destination "
         'question with "japan, not me, for my friend" states BOTH the '
@@ -1020,23 +1038,6 @@ def _apply_answer(
     answer_text = answer_text.strip()
     idx_str, field = missing_field_path.split(".")
 
-    # destinationCountry / reason / requestFor: a plain-text answer with no
-    # digits gets the TopicSwitch check (an email answering requestFor is
-    # the one legitimate exception that can contain digits, which simply
-    # skips this shortcut and falls to the generic AI-extraction path
-    # below instead — still handled correctly) and is then routed through
-    # the scoped AI extraction below rather than trusted verbatim —
-    # TopicSwitch only confirms the reply is a real attempt to answer, not
-    # that the reply IS the value itself (e.g. "i want to travel to cuba"
-    # is a real answer, but "Cuba" — not the whole sentence — is the
-    # actual destination).
-    trusts_directly = (
-        field in ("destinationCountry", "reason", "requestFor")
-        and not any(ch.isdigit() for ch in answer_text)
-    )
-    if trusts_directly and _is_topic_switch(follow_up_question, answer_text, config):
-        raise TopicSwitch()
-
     if idx_str == "*":
         # Shared answer for every leg still missing this field (currently
         # only "*.reason" — see _validate). A reason never legitimately
@@ -1053,6 +1054,41 @@ def _apply_answer(
             "destinationCountry": None, "startDate": None, "endDate": None,
             "reason": None, "requestFor": None,
         })
+
+    if field == "requestFor" and "@" in answer_text:
+        # Deterministic shortcut, checked before anything else: an email
+        # address answering "who is this for" / "could you share their
+        # email" is completely unambiguous — no AI call needed, and
+        # critically none of the risk that one fails to parse a bare
+        # email reply with no surrounding words (the model has nothing to
+        # reason about, so this is exactly where extraction is most
+        # likely to come back empty and, before this shortcut existed,
+        # get the reply silently ignored and the same question re-asked).
+        # Combines with an existing concrete name if there is one, e.g.
+        # "John" + "john@company.com" -> "John, john@company.com";
+        # otherwise the email stands alone.
+        existing = extracted[idx].get("requestFor")
+        if existing and "@" not in existing and not _is_vague_on_behalf_reference(existing):
+            extracted[idx]["requestFor"] = f"{existing}, {answer_text}"
+        else:
+            extracted[idx]["requestFor"] = answer_text
+        return extracted
+
+    # destinationCountry / reason / requestFor: a plain-text answer with no
+    # digits gets the TopicSwitch check (neither field ever legitimately
+    # needs a number — an email answering requestFor is handled by the
+    # deterministic shortcut above and never reaches here) and is then
+    # routed through the scoped AI extraction below rather than trusted
+    # verbatim — TopicSwitch only confirms the reply is a real attempt to
+    # answer, not that the reply IS the value itself (e.g. "i want to
+    # travel to cuba" is a real answer, but "Cuba" — not the whole
+    # sentence — is the actual destination).
+    trusts_directly = (
+        field in ("destinationCountry", "reason", "requestFor")
+        and not any(ch.isdigit() for ch in answer_text)
+    )
+    if trusts_directly and _is_topic_switch(follow_up_question, answer_text, config):
+        raise TopicSwitch()
 
     if trusts_directly:
         # Don't trust the reply verbatim, even though TopicSwitch already

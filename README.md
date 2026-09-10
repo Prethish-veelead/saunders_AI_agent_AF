@@ -60,7 +60,9 @@ Single message, everything given:
 }
 ```
 
-**`requestFor`** is `null` for the ordinary case — the requester is traveling themselves — and nothing about the flow changes: no extra field, no extra question, identical to before this existed. It's only populated when the conversation itself signals the trip is for someone else — "for my manager", "on behalf of my friend", "for John" — and this is recognized wherever it's mentioned, not just as the answer to a dedicated question (e.g. stating it while answering the destination question also works: *"cuba, not me, for my friend"* captures both `destinationCountry` and `requestFor` from the same reply). If what's captured is just a bare placeholder with no actual name or email ("someone", "my manager", "him"), exactly one follow-up question asks for a concrete identifier:
+**`requestFor`** is `null` for the ordinary case — the requester is traveling themselves — and nothing about the flow changes: no extra field, no extra question, identical to before this existed. It's only populated when the conversation itself signals the trip is for someone else — "for my manager", "on behalf of my friend", "for John" — and this is recognized wherever it's mentioned, not just as the answer to a dedicated question (e.g. stating it while answering the destination question also works: *"cuba, not me, for my friend"* captures both `destinationCountry` and `requestFor` from the same reply).
+
+An **email address is always required** to consider this resolved — a bare placeholder ("someone", "my manager", "him") gets the broad question, and a name alone ("John") isn't treated as sufficient either, since it can't uniquely identify who to book the trip for:
 ```json
 {
   "extracted": [ { "destinationCountry": null, "startDate": null, "endDate": null, "reason": null, "requestFor": "my manager" } ],
@@ -68,7 +70,15 @@ Single message, everything given:
   "follow_up_question": "Who is this travel request for? Could you share their name or email address?"
 }
 ```
-A real name or email given anywhere — including inline in the very first message ("for John") — is accepted immediately with no question at all.
+Once a name is known but no email yet, the follow-up narrows instead of repeating itself:
+```json
+{
+  "extracted": [ { "destinationCountry": null, "startDate": null, "endDate": null, "reason": null, "requestFor": "John" } ],
+  "missing_field_path": "0.requestFor",
+  "follow_up_question": "Could you share John's email address?"
+}
+```
+An email given anywhere — including inline in the very first message ("for john@company.com") — is accepted immediately with no question at all, and combines with an already-known name (`"John"` + `"john@company.com"` → `"John, john@company.com"`).
 
 **`startDate`/`endDate` carry both the date and time in one value**, one control (a calendar plus an AM/PM clock) and one question per leg boundary rather than two. `"YYYY-MM-DDTHH:mm"` — naive wall-clock, no offset, 24-hour time in the value (`"2027-08-05T09:30"`) — once both are known; a date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value, not an error. Spoken times normalize the same way regardless of phrasing — `"9:30am"`, `"half nine"`, `"6 in the evening"` all become 24-hour on the wire; any AM/PM display is a caller concern.
 
@@ -279,6 +289,8 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 ## Changelog
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
+
+- **2026-09-10** — Two follow-ups to yesterday's `requestFor` (raising a request for someone else) feature. First, a real bug: a valid email address answering the "who is this for" question could get silently ignored and the same question re-asked, if the AI extraction step happened to fail to parse a bare email with no surrounding words — fixed with a deterministic check (an "@" in the reply is unambiguous, no AI interpretation needed) that also fixed an inline email in the very first message getting mistakenly shortened to a guessed name (e.g. "john@company.com" -> "John"). Second, a policy change: a name alone ("John", "my manager") is no longer treated as sufficient — an actual email address is now always required to consider `requestFor` resolved, with a name-only answer followed by one more targeted question ("Could you share John's email address?") instead of skipping ahead. Live and verified on both environments.
 
 - **2026-09-10** — Travel requests now support being raised on someone else's behalf. New field `requestFor` (null by default — the ordinary self-request case is completely unaffected) captures phrasing like "for my manager", "on behalf of my friend", "for John" wherever it's mentioned in the conversation, not just as the answer to a dedicated question. Checked FIRST, before reason — if what's captured is a bare placeholder with no name or email ("someone", "my manager"), exactly one question asks *"Who is this travel request for? Could you share their name or email address?"*; a real name or email given anywhere (including inline in the first message) skips the question entirely. Live and verified on both environments — 23/23 existing regression checks unaffected, 17/17 new scenario checks passing.
 - **2026-09-09** — The SharePoint approved-country list itself was expanded by its owner from 56 narrow entries to a full 195-country list — not a code change, but worth noting: Germany, Japan, France, and most other everyday destinations are now legitimately approved where they were rejected before. Confirmed the AI country-match fallback (added 2026-09-08) adapts automatically to renamed entries on the new list (e.g. "Burma" -> "Myanmar", "North Korea" -> "Korea (North)") with no code changes needed.
