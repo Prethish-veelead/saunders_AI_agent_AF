@@ -177,7 +177,34 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "whether a topic was named — contrast with rule 5's bare create "
         'phrasing, which has NO "how"/"where" question at all (e.g. '
         '"raise a request", "request needs to be raised" — a direct '
-        "attempt to create something now, not a question about how to).\n"
+        "attempt to create something now, not a question about how to). "
+        'Separately, a "Can I"/"Could I" polite phrasing is NOT by itself '
+        "a process question, even though it's grammatically a question — "
+        "it's just a courteous way of making the request itself, and by "
+        'default should be read EXACTLY as if "Can I"/"Could I" were '
+        "deleted from the sentence, then classified by whatever rule the "
+        "remaining words match. Work through rules 2-5 on what's left "
+        'before ever concluding rule 1: "Can I create a request for my '
+        'friend instead of myself?" / "Could I raise a request for '
+        'someone else?" -> delete "Can I"/"Could I" -> "create a request '
+        'for my friend..." / "raise a request for someone else" -> no '
+        'topic named -> rule 5 (ambiguous_request), NOT rule 1. "Can I '
+        'raise a travel request for another person?" -> delete "Can I" '
+        '-> "raise a travel request for another person" -> contains '
+        '"travel" -> rule 3 (travel_request), NOT rule 1 and NOT rule 5 '
+        "— naming a topic always takes priority over the no-topic "
+        'carve-out, "Can I" or not. The ONLY time a "Can I"/"Could I" '
+        "question actually stays rule 1 is when what's left after "
+        "deleting it is itself a genuine question about the MECHANICS or "
+        'POLICY of an already-named feature, not a request to act: "Can I '
+        'raise a travel request without manager approval?" -> delete '
+        '"Can I" -> "raise a travel request without manager approval" — '
+        "this is asking whether/how something works, not stating an "
+        "intent to raise one right now, so it stays rule 1. The deciding "
+        "question is always: once you remove the polite \"Can I\", is what "
+        "remains an actual request to do the thing (-> rules 2-5, same "
+        "as any other phrasing), or a genuine question about whether/how "
+        "it can be done (-> rule 1)?\n"
         "2. Does the message use a LOOKUP/retrieval verb or phrase — get, "
         'show, see, check, find, list, pull up, "what\'s the status of" '
         "— about a request or ticket that's implied to ALREADY exist? "
@@ -250,8 +277,11 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'request"/"the request"/"all the requests", which always mean '
         "rule 2 above instead regardless of which verb precedes them) — "
         'and name NO topic at all (e.g. bare "raise a request", "request '
-        'needs to be raised", "can you create a request for me")? -> '
-        '"ambiguous_request" — this is the ONLY case where you ask which '
+        'needs to be raised", "can you create a request for me", "Can I '
+        'create a request for my friend instead of myself?", "Could I '
+        'raise a request for someone else?" — a "Can I"/"Could I" polite '
+        "phrasing belongs here too, per rule 1's contrast above, not "
+        'rule 1)? -> "ambiguous_request" — this is the ONLY case where you ask which '
         "topic they mean, and only because no topic word exists anywhere "
         "in the message, never because details are missing. Excludes "
         'anything containing a "how"/"where" process question (see rule '

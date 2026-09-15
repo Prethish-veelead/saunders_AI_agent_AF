@@ -233,14 +233,20 @@ never substitute a different country.
 - requestFor: if the message indicates this trip is being arranged for \
 someone OTHER than the person sending the message — "for my manager", \
 "on behalf of my friend", "for John", "for john@company.com", "my \
-colleague needs to travel", "can I raise this for a team member" — set \
-requestFor to identify who it's for: an email address EXACTLY as written \
-if one was given (e.g. "john@company.com" -> "john@company.com" — never \
-shorten it to a guessed name like "John"), otherwise their name if one \
-was given (e.g. "John"), otherwise the relation/word actually used (e.g. \
-"my manager", "my colleague", "someone"). If the message says nothing \
-suggesting the trip is for anyone other than the sender, leave \
-requestFor null — this is the default, ordinary case.
+colleague needs to travel", "can I raise this for a team member", "can I \
+raise a request for another person" — set requestFor to identify who \
+it's for: an email address EXACTLY as written if one was given (e.g. \
+"john@company.com" -> "john@company.com" — never shorten it to a \
+guessed name like "John"), otherwise their name if one was given (e.g. \
+"John"), otherwise the relation/word actually used (e.g. "my manager", \
+"my colleague", "someone", "another person"). This applies EVEN WHEN the \
+message is phrased as a question ("Can I...?", "Could I...?") — a \
+question phrasing is just a polite way of stating the same intent, never \
+a reason to treat the on-behalf indication as absent or to return an \
+empty leg; read it exactly as if "Can I"/"Could I" were deleted from the \
+sentence. If the message says nothing suggesting the trip is for anyone \
+other than the sender, leave requestFor null — this is the default, \
+ordinary case.
 - The words "travel"/"trip" used only to describe the ACT of traveling \
 (e.g. "I want to travel", "I need to take a trip", "raise a travel \
 request") do NOT by themselves state a reason — reason must name an \
@@ -252,7 +258,13 @@ travel for business" -> reason: "business" (a purpose was given).
 all — no destination, no dates/times, no reason, and no indication it's \
 for someone else. If any one of those is stated, create one leg entry \
 with that detail filled in and the rest null, even with no destination \
-named."""
+named. This still applies when the message is phrased as a question \
+("Can I raise a request for another person?") or is short/combined with \
+a one-word category answer (e.g. "Can I raise a request for another \
+person?. travel") — the on-behalf indication ("for another person") is \
+real trip detail on its own and must produce one leg with requestFor \
+set, never an empty array just because the rest of the sentence is a \
+question or the message overall is short."""
 
 
 def _extract_fields(text: str, config: dict[str, str]) -> list[dict[str, Any]]:
