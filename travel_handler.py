@@ -14,13 +14,12 @@ requestFor is null for the ordinary case — the requester is traveling
 themselves — and is never asked about unless the conversation itself
 signals otherwise. See design decision 12 below.
 
-startDate/endDate carry date AND time together, one control/one question
-per leg boundary. "YYYY-MM-DDTHH:mm" (naive wall-clock, no offset, 24-hour
-time — e.g. "2027-08-05T09:30") once the time is known; plain "YYYY-MM-DD"
-is a legitimate, non-final value when only the date has been given so far
-— never invent a time to fill it in. Any AM/PM display is a caller
-concern, same split already used elsewhere (ISO on the wire,
-display-formatted on screen).
+startDate/endDate are plain dates — "YYYY-MM-DD" — and that's all that's
+ever asked for; time is not collected in this conversation (see design
+decision 11). If a message happens to volunteer a time anyway (e.g. "5
+Aug 2027 9:30am"), it's still captured as "YYYY-MM-DDTHH:mm" rather than
+discarded, but a date with no time is just as complete — never blocked
+or re-asked over a missing time.
 
 Design decisions (per current requirements):
   1. One Azure OpenAI call extracts everything the message states — including
@@ -88,17 +87,15 @@ Design decisions (per current requirements):
      like the business-reason check — does NOT fail open: a failed AI
      call propagates as a system error rather than silently allowing an
      unresolved country through.
-  11. startDate/endDate are asked about as ONE question each, covering
-     both the date and the time — "When does the trip to {country}
-     start? Please give the date and time." A date-only value
-     ("YYYY-MM-DD", no time) is a legitimate intermediate state, not an
-     error: _validate() re-asks specifically for the time ("What time on
-     5 Aug 2027 does the trip to Cuba start?") rather than the whole
-     question again. A time given with no date of its own (e.g. just
-     "9:30am" answering that time-only re-ask) is merged onto the date
-     already held for that field, never treated as unrelated or as a
-     new leg. A genuinely ambiguous time ("at 7" — AM or PM?) leaves the
-     date-only value untouched rather than inventing a time — see
+  11. startDate/endDate only ever need the date — "What's the start date
+     for the trip to {country}?" — time is not asked about at all
+     (dropped 2026-09-11: in practice users don't give it when asked,
+     so asking just adds friction for no benefit). A leg is complete
+     once its dates are known, whether or not a time is attached. If a
+     message happens to volunteer a time anyway (e.g. "5 Aug 2027
+     9:30am"), _parse_leg_moment still recognizes and keeps the combined
+     "YYYY-MM-DDTHH:mm" value rather than discarding it — this just
+     means nothing is ever asked or blocked on to get one. See
      _is_valid_hhmm and _parse_leg_moment.
   12. requestFor captures a request being raised for someone other than
      the requester — "for my manager", "on behalf of my friend", "for
@@ -211,7 +208,10 @@ when both are known. If only the date was given, return just "YYYY-MM-DD" \
 — that's a legitimate value, NOT an error; never invent a time to fill it \
 in. If only a time is stated for a boundary whose date is given elsewhere \
 in the same message, attach it to that date rather than leaving it \
-unused. Normalize spoken times to 24-hour no matter how they were phrased \
+unused — but if a time is stated with NO date anywhere for that boundary, \
+leave the field null entirely; never invent or default to today's date \
+(or any other date) just because a time was mentioned with nothing to \
+attach it to. Normalize spoken times to 24-hour no matter how they were phrased \
 — "9:30am" -> "09:30", "half nine" (evening) -> "21:30", "6 in the \
 evening" / "6pm" -> "18:00", "noon" -> "12:00". If a time is genuinely \
 ambiguous — "at 7" with no AM/PM, "sometime in the morning" — omit the \
@@ -373,13 +373,11 @@ def _parse_leg_moment(value: Any) -> Optional[tuple[date, Optional[str]]]:
 
 def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     """True if destinationCountry/startDate/endDate are all present and
-    FULLY valid (date AND time) for this leg — reason is checked
-    separately. Mirrors the same checks inline in _validate()'s per-leg
-    loop below; kept as a separate helper only for the multi-leg
+    valid for this leg (a time, if any, is not required) — reason is
+    checked separately. Mirrors the same checks inline in _validate()'s
+    per-leg loop below; kept as a separate helper only for the multi-leg
     reason-batching pre-check, which needs a yes/no answer rather than an
-    early-return message. A date-only value (time not yet collected)
-    does NOT count as valid here — the batching heuristic only fires once
-    every leg is otherwise completely done.
+    early-return message.
     """
     country = leg.get("destinationCountry")
     if not country or any(ch.isdigit() for ch in country):
@@ -387,13 +385,13 @@ def _leg_country_and_dates_valid(leg: dict[str, Any], today: date) -> bool:
     if not country_list.is_country_approved(country):
         return False
     parsed_start = _parse_leg_moment(leg.get("startDate"))
-    if parsed_start is None or parsed_start[1] is None:
+    if parsed_start is None:
         return False
     start_dt, _ = parsed_start
     if start_dt < today:
         return False
     parsed_end = _parse_leg_moment(leg.get("endDate"))
-    if parsed_end is None or parsed_end[1] is None:
+    if parsed_end is None:
         return False
     end_dt, _ = parsed_end
     return end_dt >= start_dt
@@ -565,7 +563,8 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
     Checks each leg in turn and returns the FIRST problem found — we ask
     one thing at a time, in this fixed order: requestFor (only if
     triggered — see design decision 12), reason, destination, start
-    date/time, end date/time. Reason is asked when destination is still
+    date, end date (time is not asked about — see design decision 11).
+    Reason is asked when destination is still
     missing — same as every other not-yet-known field. The one
     exception: a destination that was ALREADY stated is validated
     (digit-guard, then the approved-country list) before reason or
@@ -672,46 +671,34 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
         start_raw = leg.get("startDate")
         if not start_raw:
-            return False, f"{i}.startDate", (
-                f"When does the trip to {country} start? Please give the date and time."
-            )
+            return False, f"{i}.startDate", f"What's the start date for the trip to {country}?"
         parsed_start = _parse_leg_moment(start_raw)
         if parsed_start is None:
             return False, f"{i}.startDate", (
-                f"I couldn't understand the start date/time for the trip to {country} — "
+                f"I couldn't understand the start date for the trip to {country} — "
                 f"could you confirm it?"
             )
-        start_dt, start_time = parsed_start
+        start_dt, _start_time = parsed_start
         if start_dt < today:
             return False, f"{i}.startDate", (
                 f"The start date for the trip to {country} is in the past — "
                 f"could you confirm the correct start date?"
             )
-        if start_time is None:
-            return False, f"{i}.startDate", (
-                f"What time on {start_dt.day} {start_dt.strftime('%b %Y')} "
-                f"does the trip to {country} start?"
-            )
 
         end_raw = leg.get("endDate")
         if not end_raw:
-            return False, f"{i}.endDate", f"And when does the trip to {country} end?"
+            return False, f"{i}.endDate", f"What's the end date for the trip to {country}?"
         parsed_end = _parse_leg_moment(end_raw)
         if parsed_end is None:
             return False, f"{i}.endDate", (
-                f"I couldn't understand the end date/time for the trip to {country} — "
+                f"I couldn't understand the end date for the trip to {country} — "
                 f"could you confirm it?"
             )
-        end_dt, end_time = parsed_end
+        end_dt, _end_time = parsed_end
         if end_dt < start_dt:
             return False, f"{i}.endDate", (
                 f"The end date for the trip to {country} is before the start date — "
                 f"could you confirm the correct end date?"
-            )
-        if end_time is None:
-            return False, f"{i}.endDate", (
-                f"What time on {end_dt.day} {end_dt.strftime('%b %Y')} "
-                f"does the trip to {country} end?"
             )
 
     return True, None, None
@@ -898,10 +885,16 @@ def _extract_followup_fields(
         '"noon" -> "12:00".\n\n'
         f'The field being asked about ("{field}") may already hold a '
         "date-only value (see current known trip details above) — if the "
-        "answer gives ONLY a time and no date of its own, combine that "
-        "time with the date ALREADY KNOWN for that same field to produce "
-        'the full "YYYY-MM-DDTHH:mm" value, rather than leaving it out or '
-        "treating it as unrelated. If the answer gives a date with no time "
+        "answer gives ONLY a time and no date of its own, AND that field "
+        "already has a date, combine the new time with the date ALREADY "
+        'KNOWN for that same field to produce the full "YYYY-MM-DDTHH:mm" '
+        "value, rather than leaving it out or treating it as unrelated. "
+        "If the answer gives ONLY a time and the field does NOT already "
+        "have a date (current known trip details shows null for it), "
+        "return null for that field instead — never invent or default to "
+        "today's date (or any other date) just because a time was given "
+        "with nothing to attach it to; a date must actually be stated or "
+        "already known before a time means anything. If the answer gives a date with no time "
         'yet, return just "YYYY-MM-DD" — that\'s a legitimate value, not '
         "an error, never invent a time to complete it. If a time is "
         'genuinely ambiguous — "at 7" with no AM/PM given, "sometime in '

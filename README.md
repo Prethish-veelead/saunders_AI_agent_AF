@@ -48,14 +48,14 @@ Any client integrating with this API should check `status === "incomplete"` **ge
 
 ### `travel_request` — creating a trip
 
-Extracts one or more trip "legs" (destination, dates+times, reason, and — only when relevant — who the trip is for) from the message in a single AI call, including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, always in this fixed order: **requestFor (only if triggered) → reason → destination → start date/time → end date/time**.
+Extracts one or more trip "legs" (destination, dates, reason, and — only when relevant — who the trip is for) from the message in a single AI call, including multiple destinations mentioned in one message. Anything missing gets asked about **one field at a time**, always in this fixed order: **requestFor (only if triggered) → reason → destination → start date → end date**.
 
 Single message, everything given:
 ```json
 {
   "type": "new", "belongto": "travel_request", "status": "complete",
   "extracted": [
-    { "destinationCountry": "Cuba", "startDate": "2027-08-05T09:30", "endDate": "2027-08-06T18:00", "reason": "client meeting", "requestFor": null }
+    { "destinationCountry": "Cuba", "startDate": "2027-08-05", "endDate": "2027-08-06", "reason": "client meeting", "requestFor": null }
   ]
 }
 ```
@@ -80,17 +80,7 @@ Once a name is known but no email yet, the follow-up narrows instead of repeatin
 ```
 An email given anywhere — including inline in the very first message ("for john@company.com") — is accepted immediately with no question at all, and combines with an already-known name (`"John"` + `"john@company.com"` → `"John, john@company.com"`).
 
-**`startDate`/`endDate` carry both the date and time in one value**, one control (a calendar plus an AM/PM clock) and one question per leg boundary rather than two. `"YYYY-MM-DDTHH:mm"` — naive wall-clock, no offset, 24-hour time in the value (`"2027-08-05T09:30"`) — once both are known; a date whose time isn't known yet is a legitimate `"YYYY-MM-DD"` value, not an error. Spoken times normalize the same way regardless of phrasing — `"9:30am"`, `"half nine"`, `"6 in the evening"` all become 24-hour on the wire; any AM/PM display is a caller concern.
-
-If a date is known but the time isn't yet, the follow-up asks specifically for the time rather than the whole question again:
-```json
-{
-  "extracted": [ { "destinationCountry": "Cuba", "startDate": "2027-08-05", "endDate": null, "reason": "client meeting" } ],
-  "missing_field_path": "0.startDate",
-  "follow_up_question": "What time on 5 Aug 2027 does the trip to Cuba start?"
-}
-```
-A genuinely ambiguous time (`"at 7"`, `"sometime in the morning"`) leaves the date-only value untouched and asks again — it's never guessed. A time given with no date of its own (e.g. just `"9:30am"` answering the time-only re-ask above) is merged onto the date already held for that field.
+**`startDate`/`endDate` only ever need the date** — `"YYYY-MM-DD"` — time is not collected in this conversation (dropped 2026-09-11: in practice users don't give it when asked, so asking just added friction with no benefit). If a message happens to volunteer a time anyway (e.g. *"5 Aug 2027 9:30am"*), it's still captured as `"YYYY-MM-DDTHH:mm"` rather than discarded, but a date with no time is just as complete — never blocked or re-asked over a missing time. A bare time with nothing to attach it to (e.g. answering the date question with just *"9:30am"*) is never accepted as if it were a date, and never silently defaults to today's date — the question is asked again instead.
 
 Missing details, ordinary self-request — follow-up question:
 ```json
@@ -102,7 +92,7 @@ Missing details, ordinary self-request — follow-up question:
 }
 ```
 
-A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about; a second or later leg's questions name its destination explicitly, e.g. *"When does the trip to Bangladesh start?"*, so a multi-destination itinerary can't be answered against the wrong leg). **Exception:** if every leg already has a valid destination and both dates/times and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
+A message can also describe several trips at once — each becomes its own entry in `extracted`, resolved in order (leg 1 must be complete before leg 2 is asked about; a second or later leg's questions name its destination explicitly, e.g. *"What's the start date for the trip to Bangladesh?"*, so a multi-destination itinerary can't be answered against the wrong leg). **Exception:** if every leg already has a valid destination and dates and 2+ of them are only missing the reason, that's asked **once** for all of them (`missing_field_path: "*.reason"`, *"What's the reason for the trips?"*) and the single answer is applied to every leg still missing it — not asked per leg.
 
 **Destination is checked against an approved list**, not accepted freely — see [Approved destination list](#approved-destination-list) below. A well-formed but unapproved country is rejected the same way a malformed one is:
 ```json
@@ -290,6 +280,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-11** — `startDate`/`endDate` no longer ask for a time at all — in practice users don't give one when asked, so the extra question just added friction. A date alone is now sufficient to complete the field; a volunteered time is still captured if given, just never required or asked for. While removing the time question, also found and fixed a real bug it exposed: a bare time answering the date question (e.g. "9:30am" with no date anywhere) could get silently combined with *today's* date instead of being rejected — fixed so a time with nothing to attach it to is never accepted as a date and never defaults to any invented date; the question is asked again instead. Live and verified on both environments.
 - **2026-09-10** — Two follow-ups to yesterday's `requestFor` (raising a request for someone else) feature. First, a real bug: a valid email address answering the "who is this for" question could get silently ignored and the same question re-asked, if the AI extraction step happened to fail to parse a bare email with no surrounding words — fixed with a deterministic check (an "@" in the reply is unambiguous, no AI interpretation needed) that also fixed an inline email in the very first message getting mistakenly shortened to a guessed name (e.g. "john@company.com" -> "John"). Second, a policy change: a name alone ("John", "my manager") is no longer treated as sufficient — an actual email address is now always required to consider `requestFor` resolved, with a name-only answer followed by one more targeted question ("Could you share John's email address?") instead of skipping ahead. Live and verified on both environments.
 
 - **2026-09-10** — Travel requests now support being raised on someone else's behalf. New field `requestFor` (null by default — the ordinary self-request case is completely unaffected) captures phrasing like "for my manager", "on behalf of my friend", "for John" wherever it's mentioned in the conversation, not just as the answer to a dedicated question. Checked FIRST, before reason — if what's captured is a bare placeholder with no name or email ("someone", "my manager"), exactly one question asks *"Who is this travel request for? Could you share their name or email address?"*; a real name or email given anywhere (including inline in the first message) skips the question entirely. Live and verified on both environments — 23/23 existing regression checks unaffected, 17/17 new scenario checks passing.
