@@ -225,6 +225,16 @@ as an entry.
 message (e.g. "26 Aug 2026" and "26-Aug-2026" both become "2026-08-26").
 - If a date is ambiguous and purely numeric (e.g. "7-9-2026" or "7/9/2026"), \
 interpret it as DD-MM-YYYY (day before month) — never MM-DD-YYYY.
+- A date expressed RELATIVE to today rather than as a specific calendar date \
+— "last week", "next month", "previous week", "this weekend", "in two \
+weeks", "past two weeks" — must still be resolved to an actual YYYY-MM-DD \
+using today's date above as the reference point (e.g. "last week" -> \
+roughly 7 days before today, "next month" -> roughly 30 days after \
+today), never left null just because it wasn't a literal calendar date. \
+This applies even when it describes something in the past — resolving it \
+to a real (past) date is what lets the past-date check catch it and \
+explain why it's not allowed, instead of the request silently having no \
+date at all.
 - Normalize destinationCountry to its standard English name and spelling, \
 correcting obvious typos (e.g. "phillipines" -> "Philippines", "austrailia" \
 -> "Australia") — correct the spelling of the country that was mentioned, \
@@ -693,8 +703,10 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
         start_dt, _start_time = parsed_start
         if start_dt < today:
             return False, f"{i}.startDate", (
-                f"The start date for the trip to {country} is in the past — "
-                f"could you confirm the correct start date?"
+                "Sorry, we can't raise a travel request for a date in the "
+                "past — you can only raise a request for today or a future "
+                f"date. Could you confirm the correct start date for the "
+                f"trip to {country}?"
             )
 
         end_raw = leg.get("endDate")
@@ -891,7 +903,14 @@ def _extract_followup_fields(
         "year, assume the current year from today's date above — never "
         "guess a different year. If a date is ambiguous and purely numeric "
         '(e.g. "7-9-2026" or "7/9/2026"), interpret it as DD-MM-YYYY (day '
-        "before month) — never MM-DD-YYYY. Normalize spoken times to "
+        "before month) — never MM-DD-YYYY. A date expressed RELATIVE to "
+        'today rather than a specific calendar date — "last week", "next '
+        'month", "previous week", "past two weeks" — must still be '
+        "resolved to an actual YYYY-MM-DD using today's date as the "
+        'reference point (e.g. "last week" -> roughly 7 days before '
+        'today), never left null just because it wasn\'t a literal '
+        "calendar date — this applies even when it describes something "
+        "in the past. Normalize spoken times to "
         '24-hour no matter how phrased — "9:30am" -> "09:30", "half nine" '
         '(evening) -> "21:30", "6 in the evening" / "6pm" -> "18:00", '
         '"noon" -> "12:00".\n\n'
