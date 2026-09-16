@@ -720,9 +720,20 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
             )
         end_dt, _end_time = parsed_end
         if end_dt < start_dt:
-            return False, f"{i}.endDate", (
-                f"The end date for the trip to {country} is before the start date — "
-                f"could you confirm the correct end date?"
+            # Clear BOTH dates and re-collect them from scratch, starting
+            # with startDate, rather than assuming only endDate was wrong
+            # and patching just that one — with two dates that don't work
+            # together, there's no way to know whether the start, the
+            # end, or both were mistyped, and silently keeping one of
+            # them is exactly what a downstream system consuming this
+            # response can misread as a still-unresolved conflict.
+            leg["startDate"] = None
+            leg["endDate"] = None
+            return False, f"{i}.startDate", (
+                "The dates you gave don't work together — the end date is "
+                "before the start date. Please check and enter the start "
+                "date again, then the end date. What's the start date for "
+                f"the trip to {country}?"
             )
 
     return True, None, None
