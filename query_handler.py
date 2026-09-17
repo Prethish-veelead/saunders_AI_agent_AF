@@ -189,11 +189,15 @@ Rules:
   for the earliest/first/oldest ("first one", "earliest", "oldest").
   null if no ordering is implied.
 - "limit": the specific count the user asked for (e.g. "latest 2" -> 2,
-  "top 3" -> 3, "show me 5 tickets" -> 5). If "sort" is set but the
-  phrasing implies a single record ("my latest request", "the most
-  recent ticket" — singular, no count word) -> 1. If neither an explicit
-  count nor "sort" is present, leave "limit" null — don't assume 1 just
-  because a search is happening.
+  "top 3" -> 3, "show me 5 tickets" -> 5). If "sort" is set but no
+  specific count is stated anywhere ("my latest request", "the most
+  recent ticket" — no count word at all) -> default to 5, not 1 — the
+  user didn't ask for exactly one, just for the most recent/oldest, so
+  return a reasonable-size batch rather than assuming they want a single
+  record. Only use exactly 1 if the user's own words say so (e.g. "just
+  one", "a single request"). If neither "sort" nor an explicit count is
+  present, leave "limit" null — don't assume any number just because a
+  search is happening.
 - "dateRaised" is when the record was submitted, not a travel date — e.g.
   "raised on aug-4" means dateRaised, but "traveling from 26 Aug" on a
   travel_request lookup means startDate.
@@ -396,7 +400,11 @@ def _extract_filters_from_answer(
         "asked to narrow it down. Extract any of the following filters their answer "
         f"actually states: {', '.join(keys)}, plus top-level \"sort\" "
         '("recent"/"oldest"/null) and "limit" (integer/null) if the reply '
-        f"expresses ordering or a count (e.g. \"the latest one\", \"top 2\").{status_note}\n\n"
+        'expresses ordering or a count (e.g. "the latest one", "top 2"). '
+        'If "sort" is implied but no specific count is stated anywhere '
+        '("the latest one", "the most recent" — no number), default '
+        '"limit" to 5, not 1 — only use 1 if the user\'s own words say so '
+        f'(e.g. "just one", "a single one").{status_note}\n\n'
         f"Today's date is {today}.\n"
         f"Already-known filters (null means still unknown): {json.dumps(existing_filters)}\n"
         f"Already-known sort: {json.dumps(existing_sort)}, limit: {json.dumps(existing_limit)}\n\n"
