@@ -130,7 +130,9 @@ Classifies which record type is being looked up (`travel_request` or `helpdesk_t
   "type": "new", "belongto": "query_request", "status": "complete",
   "query": {
     "record_type": "travel_request",
-    "filters": { "destinationCountry": "Cuba", "startDate": null, "endDate": null, "dateRaised": null, "ticketId": null, "description": null }
+    "filters": { "destinationCountry": "Cuba", "startDate": null, "endDate": null, "dateRaised": null, "ticketId": null, "description": null, "status": null },
+    "sort": null,
+    "limit": null
   }
 }
 ```
@@ -139,16 +141,42 @@ If the record type isn't clear from the message (*"list all the requests"*, *"ge
 ```json
 {
   "type": "new", "belongto": "query_request", "status": "incomplete",
-  "extracted": { "record_type": null, "filters": {} },
+  "extracted": { "record_type": null, "filters": {}, "sort": null, "limit": null },
   "missing_field": "record_type",
   "follow_up_question": "Is that a travel request or a helpdesk ticket?"
 }
 ```
-Once the record type is known, it asks for at least one filter to narrow the search — unlike creating a travel request, not every field is required, just enough to search by. Answering **"all"**, **"everything"**, or **"any"** is recognized as a deliberate "no filter, show me everything" answer and completes the query immediately, rather than looping the same question forever.
+Once the record type is known, it asks for at least one filter (or a sort/limit hint, see below) to narrow the search — unlike creating a travel request, not every field is required, just enough to search by. Answering **"all"**, **"everything"**, or **"any"** is recognized as a deliberate "no filter, show me everything" answer and completes the query immediately, rather than looping the same question forever.
 
 Filter fields differ by record type, since the two don't share a schema:
-- **`travel_request`:** `destinationCountry`, `startDate`, `endDate`, `dateRaised` (when it was submitted), `ticketId`, `description` (free-text keyword search)
-- **`helpdesk_ticket`:** `ticketId`, `dateRaised`, `subject` (free-text keyword search), `status`
+- **`travel_request`:** `destinationCountry`, `startDate`, `endDate`, `dateRaised` (when it was submitted), `ticketId`, `description` (free-text keyword search), `status` — `null`, or an **array** of one or more of `"pending"`/`"approved"`/`"rejected"`/`"cancelled"` (an array, not a single string, so one message can ask for more than one status at once — see example below)
+- **`helpdesk_ticket`:** `ticketId`, `dateRaised`, `subject` (free-text keyword search), `status` (a plain free-text ticket status like `"open"`/`"closed"` — unrelated to the fixed travel-status vocabulary above)
+
+**`sort`/`limit` — since 2026-09-17.** Two fields alongside `filters`, at the same level as `record_type`, expressing ordering and a result count: `"sort"` is `"recent"` (most recent/latest/newest), `"oldest"` (earliest/first), or `null`. `"limit"` is the number of records asked for (`"latest 2"` → `2`), or `1` when `sort` is set but the phrasing implies a single record (`"my latest request"`), or `null` if neither is expressed. A sort/limit hint is enough on its own to complete the query even with zero filters — *"Can you tell me the status of my latest travel request?"* needs no destination, date, or status to be a complete, specific query:
+```json
+{
+  "type": "new", "belongto": "query_request", "status": "complete",
+  "query": {
+    "record_type": "travel_request",
+    "filters": { "destinationCountry": null, "startDate": null, "endDate": null, "dateRaised": null, "ticketId": null, "description": null, "status": null },
+    "sort": "recent",
+    "limit": 1
+  }
+}
+```
+A message naming more than one status resolves to all of them: *"show me the latest 2 approved and reject travel request ticket for cuba reason meeting client"* →
+```json
+{
+  "type": "new", "belongto": "query_request", "status": "complete",
+  "query": {
+    "record_type": "travel_request",
+    "filters": { "destinationCountry": "Cuba", "startDate": null, "endDate": null, "dateRaised": null, "ticketId": null, "description": "client meeting", "status": ["approved", "rejected"] },
+    "sort": "recent",
+    "limit": 2
+  }
+}
+```
+As with every filter in this codebase, **`sort`/`limit`/`status` are extracted hints only — no sorting, limiting, or status filtering actually happens here.** There's no persistence layer or lookup logic in this Function App; whatever consumes this response owns applying these values to the real search.
 
 ### `ambiguous_request` — wants to create something, doesn't say what
 
@@ -280,6 +308,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-17** — `query_request` (looking up an existing travel request/ticket) now extracts sorting/limiting/status hints, not just exact-match filters. Two new top-level fields alongside `filters`: `"sort"` (`"recent"`/`"oldest"`/`null`) and `"limit"` (an integer count, or `1` when a sort is implied for a single record, or `null`). `travel_request`'s filters also gained `"status"` — `null`, or an **array** of `"pending"`/`"approved"`/`"rejected"`/`"cancelled"` (an array so a single message can name more than one, e.g. "approved and rejected" -> `["approved", "rejected"]`). A sort/limit hint alone (no other filter at all) is now enough to complete the query — *"Can you tell me the status of my latest travel request?"* was previously stuck asking for a filter it didn't need. No lookup/sorting logic was added here — these are still just extracted hints for whatever system performs the real search. Live and verified on client (23/23 existing regression checks unaffected, 8/8 new scenario checks passing).
 - **2026-09-17** — Switched the client's chat model from `gpt-4o` to `gpt-5`, since `gpt-4o` is now marked "Deprecating" on the client's Azure OpenAI resource. `gpt-5` is a reasoning-family model, already supported automatically by the existing model-family-aware request builder — no code changes were needed, just the `AZURE_OPENAI_CHAT_DEPLOYMENT` app setting. Verified with a full side-by-side comparison against `gpt-4o` on the classification rulebook and field extraction (identical categories and identical extracted fields) before switching, then the full 23-scenario regression suite live on the client, 23/23 passing after the switch. Responses are slower per call than `gpt-4o` (reasoning models take longer to respond) — worth watching if latency becomes noticeable.
 - **2026-09-16** — When a trip's end date is before its start date, both dates are now cleared and re-collected from scratch — starting with the start date — instead of assuming only the end date was wrong and silently keeping the (possibly also mistaken) start date. *"The dates you gave don't work together — the end date is before the start date. Please check and enter the start date again, then the end date. What's the start date for the trip to Japan?"* There's no way to know from a swapped/conflicting pair which side was actually mistyped, and patching just one risked exactly the kind of stuck loop a downstream system consuming this response could get into. Live and verified on client.
 - **2026-09-16** — A start date in the past now gets a clear, explicit explanation — *"Sorry, we can't raise a travel request for a date in the past — you can only raise a request for today or a future date. Could you confirm the correct start date..."* — instead of the previous neutral "...is in the past — could you confirm the correct start date?", which didn't actually say why it wasn't allowed. Also taught extraction to resolve RELATIVE date phrases ("last week", "previous week to next week", "past two weeks") into real calendar dates using today's date as the reference point, rather than leaving them unparsed — so a vague past-referring phrase now correctly reaches the same clear rejection message instead of silently having no date at all. A genuine future date (relative or absolute) is unaffected. Live and verified on client.
