@@ -261,8 +261,8 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "other details — an empty travel request is still travel_request, "
         "never ambiguous.\n"
         "4. Does the message name a specific IT/workplace topic — password, "
-        'VPN, hardware, access, "helpdesk", or "ticket" specifically tied '
-        'to an IT/workplace context (e.g. "helpdesk ticket", "IT ticket", '
+        'VPN, access, "helpdesk", or "ticket" specifically tied to an '
+        'IT/workplace context (e.g. "helpdesk ticket", "IT ticket", '
         '"support ticket", "ticket for my VPN") — even alongside a generic '
         'verb (e.g. "raise a ticket for my VPN", "open a helpdesk '
         'ticket")? -> "helpdesk". A bare "ticket" with no IT/workplace '
@@ -271,6 +271,28 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         'ticket" name no IT/workplace context and must NOT be classified '
         '"helpdesk" (the same principle as rule 2\'s contrastive example, '
         "applied to create-style phrasing instead of lookups).\n"
+        "\"Hardware\" here means IT/computing equipment specifically — a "
+        "laptop, desktop, monitor, keyboard, mouse, printer, scanner, "
+        "phone/mobile device, headset, docking station, or network "
+        'equipment ("my laptop screen is flickering", "the printer is out '
+        'of paper" -> "helpdesk"). It does NOT mean general office/'
+        "facilities equipment just because something is broken or not "
+        'working — a coffee machine, a desk chair, air conditioning, '
+        "lighting, or furniture are NOT IT hardware, regardless of "
+        '"not working"/"broken" phrasing, and must NOT be classified '
+        '"helpdesk" on that basis alone: "coffee machine not working", '
+        '"my desk chair is broken", "the aircon isn\'t working" are NOT '
+        '"helpdesk" (they fall through to rule 6, "general_query" — a '
+        "different business team handles facilities/office equipment, "
+        "not ICT).\n"
+        "A bare greeting or address TO the helpdesk, even with no request "
+        'stated yet — "helpdesk", "hi helpdesk", "hello helpdesk team" — '
+        "still matches this rule and classifies as \"helpdesk\", never "
+        '"general_query", purely because "helpdesk" was named; it does '
+        "NOT need an accompanying verb or stated issue the way other "
+        "topics under this rule do (a dedicated greeting-message step "
+        "handles the reply separately, but classification itself must "
+        "still land here).\n"
         "5. Does the message use a CREATE verb — raise, create, open, "
         "submit, file — for a NEW request or ticket that doesn't exist "
         'yet, phrased indefinitely ("a request"/"a ticket", NOT "my '
@@ -443,23 +465,32 @@ def handle_helpdesk_request(text: str) -> dict[str, Any]:
 
 
 def handle_general_query(text: str) -> dict[str, Any]:
-    """Catch-all for anything that isn't clearly helpdesk, travel, or a
-    lookup of an existing travel request/helpdesk ticket — e.g. "get my
-    movie ticket to bahubali 2", "tell me a joke", "what did I ask you
-    yesterday?". This assistant only handles travel requests and helpdesk
-    tickets, so rather than silently passing the raw question through
-    (the previous behavior), this returns a polite refusal that steers
-    the user back on-topic. No history/lookup logic runs here — that
-    would still need a persistence layer and a stable per-user
-    identifier, neither of which exist yet.
+    """Catch-all for anything that isn't clearly helpdesk/ICT, travel, or a
+    lookup of an existing travel request/helpdesk ticket — e.g. "coffee
+    machine not working", "get my movie ticket to bahubali 2", "can I get
+    reimbursed for my parking". This only ever means the message isn't an
+    ICT/travel matter AT ALL — it is NOT a judgment about whether a real
+    IT/workplace question happens to be covered by a KB article; this
+    codebase never checks against KB articles (there's no KB lookup here
+    — that's entirely a downstream system's job once something is tagged
+    "helpdesk"), so any message that plausibly names an IT/workplace
+    topic still classifies as "helpdesk" and is passed through as normal,
+    matching KB article or not. Since 2026-09-22, this returns an
+    explicit redirect instead of the silent passthrough used between
+    2026-09-02 and then — the previous "no refusal" behavior actively
+    forwarded off-topic messages downstream as if they were real ICT
+    tickets. No history/lookup logic runs here — that would still need a
+    persistence layer and a stable per-user identifier, neither of which
+    exist yet.
     """
     return {
         "status": "complete",
         "question": text,
-        "follow_up_question": (
-            "I'm not able to help with that — I can only assist with "
-            "travel requests and helpdesk tickets. Please ask me "
-            "something related to submitting or looking up one of those."
+        "message": (
+            "Thank you for your enquiry. This matter falls outside the "
+            "scope of ICT services. Please contact the relevant business "
+            "team responsible for this area, as they will be best placed "
+            "to assist you."
         ),
     }
 
@@ -741,16 +772,15 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         elif classification["category"] == "ambiguous_request":
             handler_result = handle_ambiguous_request(text)
             belongto = "ambiguous_request"
+        elif classification["category"] == "general_query":
+            # Since 2026-09-22: a distinct terminal outcome, not merged
+            # into "helpdesk" — see handle_general_query for why. The
+            # downstream consumer should treat this the same as a
+            # cancelled/complete response: show handler_result["message"]
+            # to the user and stop, no ICT ticket handling involved.
+            handler_result = handle_general_query(text)
+            belongto = "general_query"
         else:
-            # Both "helpdesk" and "general_query" land here. general_query
-            # is still detected by the classifier (rule 6 above) — kept,
-            # not deleted — but is no longer surfaced as its own outcome;
-            # it's routed into the helpdesk handler instead of
-            # handle_general_query()'s refusal, per explicit direction.
-            # Both get the same greeting check below, since a bare
-            # address to the helpdesk ("helpdesk", "hi helpdesk") can
-            # land in either bucket depending on phrasing, and both
-            # already end up as belongto "helpdesk".
             belongto = "helpdesk"
             if _is_helpdesk_greeting(text, config):
                 handler_result = {
