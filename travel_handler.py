@@ -121,6 +121,30 @@ Design decisions (per current requirements):
      Checked FIRST — before reason, before destination — establishing
      who the trip is actually for takes priority over why or where,
      whenever it comes up at all.
+  13. Mid-flow field correction: while a leg is still incomplete, a reply
+      can ask to CHANGE a field that was already answered earlier in that
+      same leg — "actually change the destination", "wait, I need to
+      change the start date" — instead of answering whatever is
+      currently pending. Detected by _classify_pending_reply, a single
+      scoped AI call that runs on every reply to a pending question and
+      does triple duty: cancel-intent detection (replacing the old
+      standalone check, so this adds no extra round trip on the common
+      path), change-of-field detection, and — when the new value was
+      given in the same message ("change destination to Japan") — a
+      flag saying so. Only a field that already holds a real value can
+      be "changed"; naming a field with no value yet is just treated as
+      a normal (if unrelated) answer attempt, with a short acknowledgment
+      that there's nothing to change there yet before repeating the
+      current question. "The date"/"the dates" with no start/end
+      specified is resolved automatically when only one of the two has a
+      value yet; if both already do, one extra clarifying question asks
+      which. Applying a correction never needs special "resume" logic —
+      the corrected field is updated (or its follow-up question swapped
+      in) and _validate() is left to run its normal fixed-order check on
+      the next turn, which naturally continues wherever the conversation
+      actually was, and naturally re-triggers any check the change now
+      invalidates (e.g. a corrected start date past the existing end
+      date hits the same end-before-start conflict handling as always).
 """
 
 import json
@@ -746,6 +770,39 @@ def _validate(extracted: list[dict[str, Any]], config: dict[str, str]) -> tuple[
 
 _FOLLOWUP_FIELDS = ("destinationCountry", "startDate", "endDate", "reason", "requestFor")
 
+_FIELD_LABELS = {
+    "destinationCountry": "destination",
+    "startDate": "start date",
+    "endDate": "end date",
+    "reason": "reason",
+    "requestFor": "who this is for",
+}
+
+
+def _blank_leg() -> dict[str, Any]:
+    return {
+        "destinationCountry": None, "startDate": None, "endDate": None,
+        "reason": None, "requestFor": None,
+    }
+
+
+def _new_value_question(field: str, country: Optional[str]) -> str:
+    """The question asked once a mid-flow correction names a field to
+    change but doesn't state the new value in the same message.
+    """
+    where = f" for the trip to {country}" if country else ""
+    if field == "destinationCountry":
+        return "What's the new destination country?"
+    if field == "reason":
+        return f"What's the new reason{where}?"
+    if field == "requestFor":
+        return "Who should this travel request be for instead? Could you share their name or email address?"
+    if field == "startDate":
+        return f"What's the new start date{where}?"
+    if field == "endDate":
+        return f"What's the new end date{where}?"
+    return f"What's the new value{where}?"
+
 
 def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
     """Does this reply express a clear intent to CANCEL/ABORT/STOP the
@@ -802,6 +859,168 @@ def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
         return False
 
     return parsed.get("is_cancel") is True
+
+
+def _classify_pending_reply(
+    leg: dict[str, Any], pending_field: str, text: str, config: dict[str, str],
+) -> dict[str, Any]:
+    """Single scoped call, run on every reply to a pending travel-request
+    question, that decides between three things at once — replacing the
+    old standalone cancel-intent check, so this adds no extra round trip
+    on the common path: does the reply mean to CANCEL the whole request;
+    does it mean to CHANGE a field that was already answered earlier in
+    this same leg (rather than answer the field currently being asked
+    about, which is always new information, never a "change"); or is it
+    a normal attempt to answer the current question. Fails open (treats
+    as a normal "answer") if the check itself errors out — a broken
+    check must never block a legitimate answer.
+    """
+    default = {"intent": "answer", "change_field": None, "value_included": False, "no_value_yet": False}
+
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    known = {k: v for k, v in leg.items() if k != pending_field}
+    system_prompt = (
+        "The user has a travel request in progress. The chatbot just asked "
+        f'them this single question, about the field "{pending_field}":\n\n'
+        f"Fields already answered earlier for this same trip (null means "
+        f"not yet answered): {json.dumps(known)}\n\n"
+        "Decide which ONE of these three the reply means:\n"
+        '1. "cancel" — a clear intent to CANCEL/ABORT/STOP the whole '
+        'request (not just decline this one question) — "cancel", '
+        '"exit", "quit", "start over", "I don\'t want this", and '
+        "similar.\n"
+        '2. "change_field" — the reply asks to CHANGE a field that was '
+        "ALREADY answered earlier (shown above with a real, non-null "
+        f'value) — NOT "{pending_field}" itself, which is always new '
+        'information right now, never a "change". Trigger words like '
+        '"change", "actually", "instead", "update", "wait", "no, I '
+        'meant" are common but not required — judge by whether the '
+        "reply clearly refers back to something already given a "
+        "different value than what was originally stated.\n"
+        '3. "answer" — anything else, including a normal attempt to '
+        f'answer the current question about "{pending_field}", AND a '
+        "reply that asks to change a field that has NO value yet in "
+        '"fields already answered" above (nothing to actually change '
+        "yet).\n\n"
+        'If "change_field", also identify WHICH field: '
+        '"destinationCountry", "reason", "requestFor", "startDate", '
+        '"endDate" — or "dates_ambiguous" if they refer to "the date" / '
+        '"the dates" / "my travel dates" generically WHILE BOTH '
+        "startDate AND endDate above already have real values (so it's "
+        "not clear which one is meant); if only ONE of startDate/endDate "
+        'already has a value, a generic "the date" unambiguously means '
+        'that one — name it directly, never "dates_ambiguous" in that '
+        "case.\n\n"
+        'Also set "value_included" to true if the reply ALSO states the '
+        'new value in the same message (e.g. "change the destination to '
+        'Japan" -> true), false if it only names what to change without '
+        'giving the new value ("I need to change the start date" -> '
+        "false). Irrelevant (leave false) unless intent is "
+        '"change_field".\n\n'
+        'If the reply names a field to change but that field has NO '
+        'value yet above, set "intent" to "answer" and "no_value_yet" '
+        'to true — otherwise "no_value_yet" is false.\n\n'
+        "Respond ONLY with a JSON object matching this schema, nothing "
+        "else:\n"
+        '{"intent": "cancel" | "change_field" | "answer", '
+        '"change_field": "destinationCountry" | "startDate" | "endDate" '
+        '| "reason" | "requestFor" | "dates_ambiguous" | null, '
+        '"value_included": true or false, '
+        '"no_value_yet": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=60,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (TravelExtractionError, json.JSONDecodeError) as exc:
+        logger.warning("Pending-reply classification failed, treating as a normal answer: %s", exc)
+        return default
+
+    if not isinstance(parsed, dict) or parsed.get("intent") not in ("cancel", "change_field", "answer"):
+        return default
+
+    change_field = parsed.get("change_field")
+    if change_field not in (
+        "destinationCountry", "startDate", "endDate", "reason", "requestFor", "dates_ambiguous",
+    ):
+        change_field = None
+
+    return {
+        "intent": parsed["intent"],
+        "change_field": change_field,
+        "value_included": parsed.get("value_included") is True,
+        "no_value_yet": parsed.get("no_value_yet") is True,
+    }
+
+
+def _resolve_date_choice(text: str, config: dict[str, str]) -> Optional[str]:
+    """Resolves the reply to "would you like to change the start date or
+    the end date?" into "startDate" or "endDate", tolerating typos and
+    casual phrasing (same reasoning as query_handler.py's
+    _classify_record_type_answer for the same "pick one of two options"
+    pattern). Returns None if the reply doesn't clearly indicate either.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        'The user was asked: "Would you like to change the start date or '
+        'the end date?" Decide which one their reply means, tolerating '
+        "typos and casual phrasing. If the reply doesn't clearly indicate "
+        "either one, say so.\n\n"
+        'Respond ONLY with a JSON object: {"resolved": "startDate" | '
+        '"endDate" | "unclear"}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise TravelExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (TravelExtractionError, json.JSONDecodeError) as exc:
+        logger.warning("Date-choice resolution failed, treating as unclear: %s", exc)
+        return None
+
+    resolved = parsed.get("resolved")
+    return resolved if resolved in ("startDate", "endDate") else None
 
 
 def _is_topic_switch(follow_up_question: str, answer_text: str, config: dict[str, str]) -> bool:
@@ -1085,10 +1304,7 @@ def _apply_answer(
         idx = int(idx_str)
 
     while len(extracted) <= idx:
-        extracted.append({
-            "destinationCountry": None, "startDate": None, "endDate": None,
-            "reason": None, "requestFor": None,
-        })
+        extracted.append(_blank_leg())
 
     if field == "requestFor" and "@" in answer_text:
         # Deterministic shortcut, checked before anything else: an email
@@ -1182,33 +1398,139 @@ def process_travel_request(
     or, if the user asked to cancel a pending request:
       {"status": "cancelled", "message": "..."}
     """
+    cancelled_response = {
+        "status": "cancelled",
+        "message": (
+            "Your travel request has been cancelled. Let me know "
+            "if you'd like to start a new one."
+        ),
+    }
+
     if pending_request and pending_request.get("missing_field_path"):
-        if _is_cancel_intent(text, config):
-            return {
-                "status": "cancelled",
-                "message": (
-                    "Your travel request has been cancelled. Let me know "
-                    "if you'd like to start a new one."
-                ),
-            }
         extracted = pending_request.get("extracted") or []
-        try:
-            extracted = _apply_answer(
-                extracted, pending_request["missing_field_path"],
-                pending_request.get("follow_up_question", ""), text, config,
-            )
-        except TopicSwitch:
+        missing_field_path = pending_request["missing_field_path"]
+        idx_str, pending_field = missing_field_path.split(".")
+
+        if pending_field == "dateChoice":
+            # Synthetic state — not a real leg field. Waiting specifically
+            # for "start date" or "end date" to disambiguate an earlier
+            # "change the date" that could have meant either.
+            idx = int(idx_str)
+            while len(extracted) <= idx:
+                extracted.append(_blank_leg())
+            if _is_cancel_intent(text, config):
+                return cancelled_response
+            resolved = _resolve_date_choice(text, config)
+            if resolved is None:
+                return {
+                    "status": "incomplete",
+                    "extracted": extracted,
+                    "missing_field_path": missing_field_path,
+                    "follow_up_question": "Sorry, did you mean the start date or the end date?",
+                }
+            country = extracted[idx].get("destinationCountry")
             return {
                 "status": "incomplete",
                 "extracted": extracted,
-                "missing_field_path": pending_request["missing_field_path"],
-                "follow_up_question": (
-                    "You have a travel request in progress. Please finish "
-                    "answering the question below to continue it, or "
-                    "refresh the chat to start a new conversation.\n\n"
-                    f"{pending_request.get('follow_up_question', '')}"
-                ),
+                "missing_field_path": f"{idx}.{resolved}",
+                "follow_up_question": _new_value_question(resolved, country),
             }
+
+        if idx_str == "*":
+            # Shared multi-leg reason question — mid-flow field correction
+            # isn't supported in this narrow batched case, just cancel/answer.
+            if _is_cancel_intent(text, config):
+                return cancelled_response
+            try:
+                extracted = _apply_answer(
+                    extracted, missing_field_path,
+                    pending_request.get("follow_up_question", ""), text, config,
+                )
+            except TopicSwitch:
+                return {
+                    "status": "incomplete",
+                    "extracted": extracted,
+                    "missing_field_path": missing_field_path,
+                    "follow_up_question": (
+                        "You have a travel request in progress. Please finish "
+                        "answering the question below to continue it, or "
+                        "refresh the chat to start a new conversation.\n\n"
+                        f"{pending_request.get('follow_up_question', '')}"
+                    ),
+                }
+        else:
+            idx = int(idx_str)
+            while len(extracted) <= idx:
+                extracted.append(_blank_leg())
+            classification = _classify_pending_reply(extracted[idx], pending_field, text, config)
+
+            if classification["intent"] == "cancel":
+                return cancelled_response
+
+            if classification["intent"] == "change_field" and classification["change_field"]:
+                change_field = classification["change_field"]
+                country = extracted[idx].get("destinationCountry")
+
+                if change_field == "dates_ambiguous":
+                    return {
+                        "status": "incomplete",
+                        "extracted": extracted,
+                        "missing_field_path": f"{idx}.dateChoice",
+                        "follow_up_question": "Would you like to change the start date or the end date?",
+                    }
+
+                if classification["value_included"]:
+                    try:
+                        _apply_answer_via_ai(
+                            extracted[idx], change_field, text, config, already_confirmed_answer=True,
+                        )
+                    except TravelExtractionError as exc:
+                        logger.warning("Correction value extraction failed, falling back to raw text: %s", exc)
+                    is_complete, mfp, q = _validate(extracted, config)
+                    if is_complete:
+                        return {"status": "complete", "extracted": extracted}
+                    new_value = extracted[idx].get(change_field)
+                    ack = f"Got it — {_FIELD_LABELS[change_field]} updated" + (f" to {new_value}" if new_value else "") + ". "
+                    return {
+                        "status": "incomplete", "extracted": extracted,
+                        "missing_field_path": mfp, "follow_up_question": ack + q,
+                    }
+
+                return {
+                    "status": "incomplete",
+                    "extracted": extracted,
+                    "missing_field_path": f"{idx}.{change_field}",
+                    "follow_up_question": _new_value_question(change_field, country),
+                }
+
+            if classification["no_value_yet"]:
+                return {
+                    "status": "incomplete",
+                    "extracted": extracted,
+                    "missing_field_path": missing_field_path,
+                    "follow_up_question": (
+                        "You haven't given that yet, so there's nothing to change there yet.\n\n"
+                        f"{pending_request.get('follow_up_question', '')}"
+                    ),
+                }
+
+            try:
+                extracted = _apply_answer(
+                    extracted, missing_field_path,
+                    pending_request.get("follow_up_question", ""), text, config,
+                )
+            except TopicSwitch:
+                return {
+                    "status": "incomplete",
+                    "extracted": extracted,
+                    "missing_field_path": missing_field_path,
+                    "follow_up_question": (
+                        "You have a travel request in progress. Please finish "
+                        "answering the question below to continue it, or "
+                        "refresh the chat to start a new conversation.\n\n"
+                        f"{pending_request.get('follow_up_question', '')}"
+                    ),
+                }
     else:
         extracted = _extract_fields(text, config)
 
