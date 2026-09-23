@@ -222,7 +222,7 @@ Since 2026-09-23. A fresh message expressing intent to cancel/delete/withdraw a 
 {
   "type": "new", "belongto": "cancel_request", "status": "complete",
   "question": "cancel the request",
-  "message": "You haven't started a travel request or helpdesk ticket yet, so there's nothing to cancel."
+  "message": "You haven't created a travel request or helpdesk ticket yet, so there's nothing to cancel."
 }
 ```
 This codebase has no persistence layer, so it can never look up or cancel a *previously submitted* record either way — naming a specific type ("cancel my travel request") doesn't change the outcome, since there's still nothing this backend can act on. **Mid-conversation cancellation is a completely different, unrelated path** — see the next section.

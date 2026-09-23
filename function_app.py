@@ -523,7 +523,7 @@ def handle_cancel_request(text: str) -> dict[str, Any]:
         "status": "complete",
         "question": text,
         "message": (
-            "You haven't started a travel request or helpdesk ticket yet, "
+            "You haven't created a travel request or helpdesk ticket yet, "
             "so there's nothing to cancel."
         ),
     }
