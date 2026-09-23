@@ -8,7 +8,7 @@ This document describes **what the system does today**. It is kept up to date as
 
 ## What it does
 
-A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns one of five outcomes:
+A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns one of six outcomes:
 
 | Category | What it means | Example message |
 |---|---|---|
@@ -17,6 +17,7 @@ A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns
 | `query_request` | Look up an existing travel request or helpdesk ticket | *"show my travel request to Cuba"*, *"list all the requests"* |
 | `ambiguous_request` | Wants to create/raise something, but doesn't say what kind | *"raise a request"* |
 | `general_query` | Not an ICT/travel matter at all — a different team's area | *"coffee machine not working"*, *"get my movie ticket to bahubali 2"* |
+| `cancel_request` | Wants to cancel/delete a request, with nothing currently in progress | *"cancel the request"*, *"delete request"* |
 
 > Between 2026-09-02 and 2026-09-22, `general_query` was routed into the `helpdesk` handler with no refusal (silently forwarded downstream as if it were a real ICT ticket). As of 2026-09-22 it's a distinct outcome again with its own polite redirect message — see Changelog and the `general_query` section below.
 
@@ -31,7 +32,7 @@ The API is **stateless** — the Function App itself remembers nothing between c
 - **`"complete"`** — nothing more needed.
 - **`"incomplete"`** — the bot needs an answer to `follow_up_question` before it can finish.
 - **`"error"`** — something failed.
-- **`"cancelled"`** (`travel_request` only) — the user asked to cancel a request that was in progress; `message` explains it.
+- **`"cancelled"`** (`travel_request`, `query_request`, or `ambiguous_request`) — the user asked to cancel a request/lookup that was in progress; `message` explains it. Since 2026-09-23 this works consistently across all three in-progress states, not just `travel_request` — see Changelog.
 
 **The contract for a caller:**
 1. When `status` comes back `"incomplete"`, show the user `follow_up_question` and save the **entire response object**.
@@ -214,6 +215,30 @@ Between 2026-09-02 and 2026-09-22, this was routed into the `helpdesk` handler w
 ```
 This is a judgment about whether the message is an ICT/travel matter **at all** — never about whether a real IT/workplace question happens to be covered by a KB article. There's no KB lookup anywhere in this codebase; any message that plausibly names an IT/workplace topic (password, VPN, hardware, access) still classifies `helpdesk` and is passed through exactly as before, matching KB article or not — only the real search/answer is owned by whatever downstream system consumes the `helpdesk` response. "Hardware" is scoped to actual IT/computing equipment (laptop, monitor, printer, phone, network gear) — general office/facilities equipment (a coffee machine, a desk chair, air conditioning) is never treated as IT hardware just because it's broken.
 
+### `cancel_request` — wants to cancel/delete, nothing in progress
+
+Since 2026-09-23. A fresh message expressing intent to cancel/delete/withdraw a request or ticket — *"cancel the request"*, *"delete request"*, *"withdraw my request"* — sent when there's no travel request, lookup, or ambiguous create-request currently in progress:
+```json
+{
+  "type": "new", "belongto": "cancel_request", "status": "complete",
+  "question": "cancel the request",
+  "message": "You haven't started a travel request or helpdesk ticket yet, so there's nothing to cancel."
+}
+```
+This codebase has no persistence layer, so it can never look up or cancel a *previously submitted* record either way — naming a specific type ("cancel my travel request") doesn't change the outcome, since there's still nothing this backend can act on. **Mid-conversation cancellation is a completely different, unrelated path** — see the next section.
+
+### Cancelling something already in progress
+
+Checked first, before anything else, whenever a travel request, a lookup, or an ambiguous create-request is mid-flow — "cancel", "delete", "exit", "never mind", "start over", and similar (tolerating typos and casual phrasing) end that specific in-progress thing immediately, rather than being mistaken for an answer to whatever question was pending:
+
+| In progress | Response |
+|---|---|
+| `travel_request` | `{"belongto": "travel_request", "status": "cancelled", "message": "Your travel request has been cancelled. Let me know if you'd like to start a new one."}` |
+| `query_request` | `{"belongto": "query_request", "status": "cancelled", "message": "Okay, cancelled. Let me know if you'd like to search for something else."}` |
+| `ambiguous_request` | `{"belongto": "ambiguous_request", "status": "cancelled", "message": "Okay, cancelled. Let me know if you'd like to raise something else."}` |
+
+**After a cancelled `travel_request`, a plain "yes"** (or "yeah"/"sure"/"go ahead" — a clear affirmative to the cancelled message's own "let me know if you'd like to start a new one") reopens a brand new travel request immediately, asking the first question (*"What's the reason for your trip?"*), rather than being classified fresh with no topic word and falling into `general_query`. Anything that ISN'T a clear affirmative to that specific offer — a different topic, a helpdesk question, "no" — is classified completely fresh instead, exactly as if nothing had just been cancelled.
+
 ---
 
 ## Approved destination list
@@ -326,6 +351,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-09-23** — Cancel/delete handling made consistent across the whole conversation lifecycle. Previously, saying "cancel" only worked mid-flow for `travel_request`; a fresh "cancel the request" with nothing in progress routed inconsistently (sometimes `query_request`, sometimes `general_query`, depending on tiny wording differences), and mid-flow `query_request`/`ambiguous_request` had no cancel handling at all — "cancel" there just looped, re-asking the same question forever. Now: (1) a fresh cancel/delete message with nothing in progress consistently returns a new `cancel_request` outcome explaining there's nothing to cancel; (2) `query_request` and `ambiguous_request` can now be cancelled mid-flow, the same as `travel_request` already could; (3) after a cancelled `travel_request`, a plain "yes" to the bot's own "would you like to start a new one?" now reopens a fresh travel request immediately, instead of falling into `general_query` for having no topic word. Live and verified on client: 19/19 new checks passing, 23/23 existing regression checks unaffected (aside from a pre-existing, separately-flagged issue found while re-running that suite — see below).
 - **2026-09-22** — `general_query` (a message that isn't an ICT/travel matter at all — a facilities issue, a different department's matter, an entertainment booking) is a distinct outcome again instead of being silently forwarded through the `helpdesk` handler as if it were a real ICT ticket (the behavior since 2026-09-02). It now returns an explicit redirect: *"Thank you for your enquiry. This matter falls outside the scope of ICT services. Please contact the relevant business team responsible for this area, as they will be best placed to assist you."* While making this change, fixed two related classifier gaps that were previously invisible (since `general_query` and `helpdesk` used to be handled identically, so misrouting between them never showed up): "hardware" was being read broadly enough that a broken coffee machine, desk chair, or air conditioner got treated as an IT matter — now scoped to actual IT/computing equipment; and a bare "hi helpdesk"/"helpdesk" greeting with no stated issue was starting to fall through to `general_query` instead of `helpdesk` (since it has no actionable request) — now always classifies `helpdesk`, as intended, regardless of whether a specific issue is stated yet. Live and verified on client (16/16 checks, including that real IT/hardware questions and the helpdesk greeting are unaffected).
 - **2026-09-22** — Travel requests now support mid-flow field correction: while a leg is still incomplete, a reply can ask to change a field that was already answered earlier ("actually change the destination", "wait, I need to change the start date") instead of answering whatever's currently pending. If the new value is given in the same message it's applied immediately with a short acknowledgment; if not, exactly one question asks for it, then the conversation resumes exactly where it was — no special "resume" logic needed, the existing validation just naturally continues and re-triggers any check the change invalidates (e.g. a corrected start date past the existing end date hits the same end-before-start conflict handling as always). An ambiguous "the date" is resolved automatically when only one of start/end has a value yet, or asked about when both do. Naming a field with nothing to change yet gets a short "nothing to change there yet" note instead of silently doing nothing. Scoped to before completion only — right after `"status": "complete"` is out of scope for now. Live and verified on client.
 - **2026-09-17** — When `sort` is set (e.g. "my latest travel request") but the user doesn't state a specific count, `limit` now defaults to `5` instead of `1` — a reasonable-size batch rather than assuming they want exactly one record. An explicit count ("latest 2") or an explicit "just one"/"a single one" still resolves exactly as stated. Live and verified on client (6/6 checks, including that an unrelated query with no sort/limit at all is unaffected).

@@ -311,6 +311,60 @@ def _wants_all(text: str) -> bool:
     return any(word in _SHOW_ALL_WORDS for word in words)
 
 
+def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
+    """Does this reply express a clear intent to CANCEL/ABORT/STOP the
+    in-progress lookup entirely — not just decline to answer the current
+    question, but end the whole search. Checked before anything else once
+    a query is pending, mirroring travel_handler.py's same-purpose check.
+    Fails open (treats as NOT a cancellation) if the check itself errors
+    out — a broken check must never block a legitimate answer.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "The user has a lookup/search in progress (looking up an existing "
+        "travel request or helpdesk ticket). Decide whether their reply "
+        "expresses a clear intent to CANCEL/ABORT/STOP the search "
+        "entirely — not merely decline to answer the current question, "
+        'but actually end the whole process. Words like "cancel", '
+        '"close", "exit", "quit", "abort", "never mind", "start over", '
+        '"don\'t bother" or similar all count, tolerating typos and '
+        "casual phrasing. A reply that attempts to answer the question, "
+        "even vaguely, or that raises an unrelated topic without asking "
+        "to stop, does NOT count.\n\n"
+        'Respond ONLY with a JSON object: {"is_cancel": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise QueryExtractionError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (QueryExtractionError, json.JSONDecodeError) as exc:
+        logger.warning("Cancel-intent check failed, treating as not a cancellation: %s", exc)
+        return False
+
+    return parsed.get("is_cancel") is True
+
+
 def _classify_record_type_answer(answer_text: str, config: dict[str, str]) -> Optional[str]:
     """AI-based disambiguation of the answer to "which record type" — a
     plain keyword match (the original approach here) has zero typo
@@ -471,7 +525,15 @@ def process_query_request(
     or:
       {"status": "incomplete", "extracted": {...}, "missing_field": "...",
        "follow_up_question": "..."}
+    or, if the user asked to cancel a pending lookup:
+      {"status": "cancelled", "message": "..."}
     """
+    if pending_request and pending_request.get("missing_field") and _is_cancel_intent(text, config):
+        return {
+            "status": "cancelled",
+            "message": "Okay, cancelled. Let me know if you'd like to search for something else.",
+        }
+
     original_text = text
     if pending_request and pending_request.get("missing_field") == "record_type":
         extracted = pending_request.get("extracted") or {"record_type": None, "filters": {}, "sort": None, "limit": None}

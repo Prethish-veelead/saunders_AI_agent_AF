@@ -53,7 +53,7 @@ RETRY_BASE_DELAY_SECONDS = float(os.environ.get("RETRY_BASE_DELAY_SECONDS", "1.5
 # useful later for logging/analytics on ambiguous questions.
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("LOW_CONFIDENCE_THRESHOLD", "0.6"))
 
-ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "query_request", "ambiguous_request", "general_query"]
+ALLOWED_CATEGORIES = ["helpdesk", "travel_request", "query_request", "ambiguous_request", "general_query", "cancel_request"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("classify_router")
@@ -130,7 +130,7 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
     headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
 
     system_prompt = (
-        "You classify an incoming chatbot question into exactly one of five "
+        "You classify an incoming chatbot question into exactly one of six "
         "categories. IMPORTANT: completeness is NEVER a reason to pick "
         '"ambiguous_request" or "general_query" — missing details like a '
         "destination, dates, or a specific IT symptom are always resolved "
@@ -138,6 +138,18 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "question you're answering here is WHICH TOPIC the message is "
         "about (travel vs. IT/helpdesk vs. neither), never whether enough "
         "detail was given.\n\n"
+        "Before anything else, check: does the message express intent to "
+        "CANCEL/DELETE/WITHDRAW/REMOVE/STOP a request or ticket, with no "
+        'other real content — "cancel", "delete", "cancel the request", '
+        '"delete request", "withdraw my request", "remove the ticket", and '
+        'similar? -> "cancel_request". This matches regardless of whether '
+        "a specific topic (travel/helpdesk) is also named alongside it "
+        '("cancel my travel request", "delete the helpdesk ticket" are '
+        'still "cancel_request") — this system has no persistence layer, '
+        "so it can never look up or cancel a previously submitted record "
+        "either way, meaning which type was named doesn't change the "
+        "outcome. If this doesn't match, move on to the numbered rules "
+        "below as normal.\n\n"
         "Decide in this exact order, stopping at the first match:\n\n"
         "1. Is the message asking for an EXPLANATION of, or INSTRUCTIONS "
         'for, the travel-request/helpdesk-ticket FEATURES THEMSELVES — '
@@ -324,7 +336,7 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "Respond ONLY with a JSON object matching this schema, nothing else:\n"
         "{\n"
         '  "category": "helpdesk" | "travel_request" | "query_request" | '
-        '"ambiguous_request" | "general_query",\n'
+        '"ambiguous_request" | "general_query" | "cancel_request",\n'
         '  "confidence": number between 0 and 1,\n'
         '  "reasoning": string (one short sentence)\n'
         "}"
@@ -495,6 +507,28 @@ def handle_general_query(text: str) -> dict[str, Any]:
     }
 
 
+def handle_cancel_request(text: str) -> dict[str, Any]:
+    """A fresh (not mid-flow) message expressing intent to cancel/delete/
+    withdraw a request or ticket — e.g. "cancel the request", "delete
+    request". Since classification only ever runs on a fresh message (an
+    in-progress travel/query/ambiguous conversation is intercepted before
+    classification and cancelled by its own handler — see
+    travel_handler.process_travel_request, query_handler.process_query_request,
+    and resolve_ambiguous_request), reaching this handler always means
+    there is genuinely nothing in progress to cancel, and this codebase
+    has no persistence layer to look up a previously submitted record
+    either way.
+    """
+    return {
+        "status": "complete",
+        "question": text,
+        "message": (
+            "You haven't started a travel request or helpdesk ticket yet, "
+            "so there's nothing to cancel."
+        ),
+    }
+
+
 def handle_travel_request(
     text: str, pending_request: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
@@ -591,6 +625,111 @@ def _classify_ambiguous_request_answer(answer_text: str, config: dict[str, str])
     return resolved if resolved in ("travel_request", "helpdesk") else None
 
 
+def _is_cancel_intent(text: str, config: dict[str, str]) -> bool:
+    """Does this reply express a clear intent to CANCEL/ABORT/STOP the
+    in-progress create-request disambiguation entirely — not just decline
+    to answer, but end the whole process. Mirrors travel_handler.py's
+    same-purpose check. Fails open (treats as NOT a cancellation) if the
+    check itself errors out.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        'The user was asked: "Is that a travel request or a helpdesk '
+        'ticket?" Decide whether their reply expresses a clear intent to '
+        "CANCEL/ABORT/STOP the request entirely — not merely decline to "
+        'answer, but actually end the whole process. Words like "cancel", '
+        '"close", "exit", "quit", "abort", "never mind", "don\'t bother" '
+        "or similar all count, tolerating typos and casual phrasing. A "
+        "reply that names travel or helpdesk, even vaguely, does NOT "
+        "count.\n\n"
+        'Respond ONLY with a JSON object: {"is_cancel": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, json.JSONDecodeError) as exc:
+        logger.warning("Cancel-intent check failed, treating as not a cancellation: %s", exc)
+        return False
+
+    return parsed.get("is_cancel") is True
+
+
+def _is_affirmative_restart(text: str, config: dict[str, str]) -> bool:
+    """After a travel request is cancelled, the bot's own message asks
+    "Let me know if you'd like to start a new one." Decide whether this
+    reply is a clear YES to that SPECIFIC offer — "yes", "yeah", "sure",
+    "yes please", "ok let's start again", "go ahead" all count. Anything
+    else — a different topic, a helpdesk question, "no", or an unrelated
+    message — does NOT count, and the caller should classify the message
+    fresh instead of forcing a restart. Fails open (treats as NOT
+    affirmative) if the check itself errors out — a broken check must
+    never force an unwanted restart.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "The chatbot just told the user their travel request was "
+        'cancelled and asked: "Let me know if you\'d like to start a new '
+        'one." Decide whether this reply is a clear YES to that specific '
+        'offer — "yes", "yeah", "sure", "yes please", "ok let\'s start '
+        'again", "go ahead" all count. Anything else — a different '
+        'topic, a helpdesk question, "no", or an unrelated message — '
+        "does NOT count.\n\n"
+        'Respond ONLY with a JSON object: {"is_affirmative": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, json.JSONDecodeError) as exc:
+        logger.warning("Affirmative-restart check failed, treating as not affirmative: %s", exc)
+        return False
+
+    return parsed.get("is_affirmative") is True
+
+
 def resolve_ambiguous_request(text: str, pending_request: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
     """Follow-up: the user has now said travel or helpdesk. Routes into
     that category's normal handler using BOTH the original ambiguous
@@ -604,6 +743,13 @@ def resolve_ambiguous_request(text: str, pending_request: dict[str, Any], config
     itself — which category this resolves to is only known here, whereas
     the caller already knows the category before calling the others.
     """
+    if _is_cancel_intent(text, config):
+        return {
+            "belongto": "ambiguous_request",
+            "status": "cancelled",
+            "message": "Okay, cancelled. Let me know if you'd like to raise something else.",
+        }
+
     original_text = pending_request.get("original_text", text)
     resolved = _classify_ambiguous_request_answer(text, config)
     combined_text = f"{original_text}. {text}" if text.strip() != original_text.strip() else original_text
@@ -729,6 +875,11 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         and previous_response.get("belongto") == "ambiguous_request"
         and previous_response.get("status") == "incomplete"
     )
+    is_travel_cancelled_followup = (
+        previous_response is not None
+        and previous_response.get("belongto") == "travel_request"
+        and previous_response.get("status") == "cancelled"
+    )
 
     try:
         if is_travel_followup:
@@ -751,6 +902,27 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             handler_result = resolve_ambiguous_request(text, previous_response, config)
             response_payload = {"type": "fetch", **handler_result}
             logger.info("Resolved ambiguous create-request to '%s'.", handler_result.get("belongto"))
+            return func.HttpResponse(
+                json.dumps(response_payload), status_code=200, mimetype="application/json"
+            )
+
+        if is_travel_cancelled_followup and _is_affirmative_restart(text, config):
+            # A clear "yes" to the cancelled message's own "let me know if
+            # you'd like to start a new one" — reopen a brand new travel
+            # request rather than classifying "yes" fresh, which has no
+            # topic word and would otherwise fall into general_query.
+            # Hardcoded rather than an extraction call: "yes" states no
+            # actual trip detail, so this is exactly the same first
+            # question travel_handler._validate() returns for an empty leg
+            # list.
+            handler_result = {
+                "status": "incomplete",
+                "extracted": [],
+                "missing_field_path": "0.reason",
+                "follow_up_question": "What's the reason for your trip?",
+            }
+            response_payload = {"type": "fetch", "belongto": "travel_request", **handler_result}
+            logger.info("Restarted a new travel request after a prior cancellation.")
             return func.HttpResponse(
                 json.dumps(response_payload), status_code=200, mimetype="application/json"
             )
@@ -780,6 +952,13 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             # to the user and stop, no ICT ticket handling involved.
             handler_result = handle_general_query(text)
             belongto = "general_query"
+        elif classification["category"] == "cancel_request":
+            # A cancel/delete-type message with nothing in progress (a
+            # mid-flow "cancel" never reaches classification at all — see
+            # the three followup checks above and handle_cancel_request's
+            # own docstring). Same terminal shape as general_query.
+            handler_result = handle_cancel_request(text)
+            belongto = "cancel_request"
         else:
             belongto = "helpdesk"
             if _is_helpdesk_greeting(text, config):
