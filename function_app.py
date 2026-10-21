@@ -450,6 +450,13 @@ def _is_helpdesk_greeting(text: str, config: dict[str, str]) -> bool:
         'issue — those are NOT just a greeting: "helpdesk, my VPN isn\'t '
         'connecting", "raise a helpdesk ticket for my printer", "hi, my '
         'laptop won\'t turn on".\n\n'
+        "It is ALSO different from a message that CLAIMS a problem exists "
+        "without naming what it is — that is a vague issue statement, "
+        'NOT a greeting, even though no specific symptom is named either: '
+        '"I got another issue", "I have another issue", "I have a '
+        'problem", "something\'s wrong" are NOT a greeting (is_greeting_'
+        "only: false) — they assert that a problem exists, which a plain "
+        'greeting/address never does.\n\n'
         'Respond ONLY with a JSON object: {"is_greeting_only": true or false}'
     )
     payload = ai_client.build_chat_payload(
@@ -511,6 +518,13 @@ def _is_vague_helpdesk_issue(text: str, config: dict[str, str]) -> bool:
         'specific — "my VPN isn\'t connecting", "laptop is slow", '
         '"password reset", "email not syncing" are NOT vague, even '
         "though they're short.\n\n"
+        "It is ALSO different from a message that is JUST a greeting or "
+        'address to the helpdesk, with no claim of a problem at all — '
+        '"helpdesk", "hi helpdesk", "hello helpdesk team" are NOT vague '
+        '(is_vague: false) — merely addressing the helpdesk never by '
+        "itself implies a problem exists; a vague-issue message "
+        'specifically ASSERTS that something is wrong ("I have an '
+        'issue"/"I have a problem"), which a bare greeting does not.\n\n'
         'Respond ONLY with a JSON object: {"is_vague": true or false}'
     )
     payload = ai_client.build_chat_payload(
@@ -1033,17 +1047,22 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
             belongto = "cancel_request"
         else:
             belongto = "helpdesk"
-            if _is_helpdesk_greeting(text, config):
-                handler_result = {
-                    "status": "complete",
-                    "question": text,
-                    "message": HELPDESK_GREETING_MESSAGE,
-                }
-            elif _is_vague_helpdesk_issue(text, config):
+            # Checked in this order: a message CLAIMING a problem exists
+            # (even unnamed) is a stronger, more specific signal than "could
+            # be read as just an opener" — checking it first avoids the
+            # greeting check's looser judgment call claiming a message like
+            # "I got another issue" first.
+            if _is_vague_helpdesk_issue(text, config):
                 handler_result = {
                     "status": "complete",
                     "question": text,
                     "message": VAGUE_HELPDESK_ISSUE_MESSAGE,
+                }
+            elif _is_helpdesk_greeting(text, config):
+                handler_result = {
+                    "status": "complete",
+                    "question": text,
+                    "message": HELPDESK_GREETING_MESSAGE,
                 }
             else:
                 handler_result = handle_helpdesk_request(text)
