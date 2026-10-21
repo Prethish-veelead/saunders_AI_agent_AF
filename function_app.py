@@ -305,6 +305,17 @@ def _classify_question(text: str, config: dict[str, str]) -> dict[str, Any]:
         "topics under this rule do (a dedicated greeting-message step "
         "handles the reply separately, but classification itself must "
         "still land here).\n"
+        'A message that merely states the user HAS an issue/problem, with '
+        'no topic named at all — "I got another issue", "I have another '
+        'issue", "I have a problem", "need help with something", '
+        '"something\'s wrong" — ALSO matches this rule and classifies as '
+        '"helpdesk", the same reasoning as the bare-greeting case above: '
+        "this system only ever handles travel requests or helpdesk "
+        "tickets, and an unspecified \"issue\"/\"problem\" with no travel "
+        "word anywhere defaults to helpdesk rather than general_query (a "
+        "dedicated clarifying-question step asks what the issue actually "
+        "is, but classification itself must still land here, not fall "
+        'through to rule 6).\n'
         "5. Does the message use a CREATE verb — raise, create, open, "
         "submit, file — for a NEW request or ticket that doesn't exist "
         'yet, phrased indefinitely ("a request"/"a ticket", NOT "my '
@@ -466,6 +477,67 @@ def _is_helpdesk_greeting(text: str, config: dict[str, str]) -> bool:
         return False
 
     return parsed.get("is_greeting_only") is True
+
+
+VAGUE_HELPDESK_ISSUE_MESSAGE = "What kind of issue are you facing? Please describe it so I can help."
+
+
+def _is_vague_helpdesk_issue(text: str, config: dict[str, str]) -> bool:
+    """True only when the message states that the user HAS an issue/
+    problem, but names no actual symptom, topic, or detail at all — "I
+    got another issue", "I have another issue", "I have a problem", "need
+    help with something". Different from a greeting (see
+    _is_helpdesk_greeting) — this message does claim there's a problem,
+    it just never says what it is. A message that names any real detail,
+    even briefly (e.g. "my VPN isn't connecting", "laptop is slow"), is
+    NOT vague. Fails open (treats it as a real, specific question) if the
+    check itself errors out — a broken check must never block a
+    legitimate issue from being passed through.
+    """
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    system_prompt = (
+        "A message was already classified as directed to an IT/workplace "
+        "helpdesk. Decide whether it merely states that the user HAS an "
+        "issue/problem without naming what it actually is — e.g. \"I got "
+        'another issue", "I have another issue", "I have a problem", '
+        '"need help with something", "something\'s wrong" — tolerating '
+        "typos and casual phrasing. This is different from a message "
+        "that names any real detail at all, even briefly or vaguely "
+        'specific — "my VPN isn\'t connecting", "laptop is slow", '
+        '"password reset", "email not syncing" are NOT vague, even '
+        "though they're short.\n\n"
+        'Respond ONLY with a JSON object: {"is_vague": true or false}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=20,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, requests.RequestException, json.JSONDecodeError) as exc:
+        logger.warning("Vague-helpdesk-issue check failed, treating as a real question: %s", exc)
+        return False
+
+    return parsed.get("is_vague") is True
 
 
 def handle_helpdesk_request(text: str) -> dict[str, Any]:
@@ -966,6 +1038,12 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
                     "status": "complete",
                     "question": text,
                     "message": HELPDESK_GREETING_MESSAGE,
+                }
+            elif _is_vague_helpdesk_issue(text, config):
+                handler_result = {
+                    "status": "complete",
+                    "question": text,
+                    "message": VAGUE_HELPDESK_ISSUE_MESSAGE,
                 }
             else:
                 handler_result = handle_helpdesk_request(text)
