@@ -23,6 +23,8 @@ A single HTTP endpoint (`/api/classify`) accepts a free-text message and returns
 
 Classification is done by an Azure OpenAI (`gpt-5`) call. Everything after that — extracting the right details, validating them, deciding what to ask next — is deterministic code, not left to the model to improvise.
 
+**A single message naming both a travel request and a helpdesk issue — since 2026-11-19.** *"I am going to Canada for work on 19/11/2026 to 20/11/2026, can you help me with travel request and my laptop is not turning on"* previously classified as only one category, silently dropping whatever the other sentence stated — now returns BOTH, nested under a new `additional_intent` field. See [Dual-intent messages](#dual-intent-messages-travel_request--helpdesk) below.
+
 ---
 
 ## How a conversation works
@@ -245,6 +247,25 @@ Checked first, before anything else, whenever a travel request, a lookup, or an 
 
 **After a cancelled `travel_request`, a plain "yes"** (or "yeah"/"sure"/"go ahead" — a clear affirmative to the cancelled message's own "let me know if you'd like to start a new one") reopens a brand new travel request immediately, asking the first question (*"What's the reason for your trip?"*), rather than being classified fresh with no topic word and falling into `general_query`. Anything that ISN'T a clear affirmative to that specific offer — a different topic, a helpdesk question, "no" — is classified completely fresh instead, exactly as if nothing had just been cancelled.
 
+### Dual-intent messages (`travel_request` + `helpdesk`)
+
+Since 2026-11-19. A single fresh message can state both a travel request and a helpdesk issue at once — *"I am going to Canada for work on 19/11/2026 to 20/11/2026, can you help me with travel request and my laptop is not turning on"*. Classification still only ever picks one primary category per the rules above, but once that primary category is `travel_request` or `helpdesk`, one additional check decides whether the same message *also* states a genuine request of the other kind, and if so extracts the exact fragment of text that states it. If found, that second request is run through its own normal handler (completely unchanged) and attached under a new `additional_intent` field:
+
+```json
+{
+  "type": "new", "belongto": "helpdesk", "status": "complete",
+  "question": "I am going to Canada for work on 19/11/2026 to 20/11/2026. can you help me with travel request and my laptop is not turning on.",
+  "additional_intent": {
+    "belongto": "travel_request", "status": "complete",
+    "extracted": [{ "destinationCountry": "Canada", "startDate": "2026-11-19", "endDate": "2026-11-20", "reason": "work", "requestFor": null }]
+  }
+}
+```
+
+**Fixed display priority, not sentence order:** `helpdesk` is always the top-level response and `travel_request` always ends up nested under `additional_intent`, regardless of which one was mentioned first in the message or which one classification actually picked as primary — "my laptop is not turning on, also I'm going to Canada..." and "I'm going to Canada..., also my laptop is not turning on" both produce the exact same shape above. This lets the consuming system act on a single, consistent signal: *if `additional_intent.belongto == "travel_request"` is present, trigger that piece separately* — the Help Desk AI answers the top-level question as normal, and the travel request (complete or still asking a follow-up question, with its own `missing_field_path`) is handled independently.
+
+This pairing (`travel_request`/`helpdesk`) is the only one currently supported — no other category combination runs this check. A message with only one real topic gets no `additional_intent` field at all, exactly as before.
+
 ---
 
 ## Approved destination list
@@ -356,6 +377,8 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 ## Changelog
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
+
+- **2026-11-19** — A single message stating both a travel request and a helpdesk issue ("I am going to Canada for work on 19/11/2026 to 20/11/2026, can you help me with travel request and my laptop is not turning on") no longer drops whichever one classification didn't pick as primary. Once the primary category is `travel_request` or `helpdesk`, one additional check decides whether the message also contains a genuine request of the other kind, and if so runs it through its own unchanged handler and attaches it under a new `additional_intent` field. Fixed display priority regardless of sentence order: `helpdesk` is always the top-level response, `travel_request` always ends up under `additional_intent`. A message with only one real topic is completely unaffected — no `additional_intent` field appears at all. Live and verified on client: 12/12 new checks passing (both sentence orders, single-topic messages unaffected), existing regression suite unaffected.
 
 - **2026-10-21** — A helpdesk message that states having an issue but names no actual symptom ("I got another issue", "I have another issue", "I have a problem") now gets a clarifying question — *"What kind of issue are you facing? Please describe it so I can help."* — instead of being passed through content-free to whatever downstream system searches a knowledge base for it (which would otherwise find nothing to match). Also fixed the classifier rule that was causing these messages to land in `general_query` instead of `helpdesk` in the first place (no IT term or travel word is present to match any existing rule) — an unspecified issue/problem now defaults to `helpdesk`, the same reasoning already used for a bare "hi helpdesk" greeting. Live and verified on client.
 

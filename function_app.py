@@ -554,6 +554,119 @@ def _is_vague_helpdesk_issue(text: str, config: dict[str, str]) -> bool:
     return parsed.get("is_vague") is True
 
 
+def _detect_secondary_intent(
+    primary_category: str, text: str, config: dict[str, str]
+) -> Optional[dict[str, str]]:
+    """When the primary classification is "travel_request" or "helpdesk",
+    decide whether the SAME message also contains the other of those two
+    as a separate, genuine request — e.g. "I'm going to Canada for work
+    19/11-20/11, also my laptop won't turn on" (travel_request primary,
+    helpdesk secondary). Returns {"category": ..., "text": ...} naming
+    the OTHER category and the exact fragment of the message that states
+    it, or None if no second request is present. This pairing is the
+    only one currently supported — a different primary category never
+    calls this. Fails open (returns None) if the check itself errors
+    out — a broken check must never invent a second request that isn't
+    there.
+    """
+    other_category = "helpdesk" if primary_category == "travel_request" else "travel_request"
+    url = (
+        f"{config['endpoint'].rstrip('/')}/openai/deployments/"
+        f"{AZURE_OPENAI_CHAT_DEPLOYMENT}/chat/completions"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+    )
+    headers = {"api-key": config["api_key"], "Content-Type": "application/json"}
+    other_description = (
+        'A helpdesk request names a real IT/workplace issue (a password, '
+        'VPN, hardware problem, access issue, etc.) — "my laptop is not '
+        'turning on", "my VPN keeps disconnecting".'
+        if other_category == "helpdesk" else
+        'A travel request states an intent to travel — a destination, '
+        'dates, or "travel request" — "I need to go to Japan for a '
+        'client meeting from 5 to 6 August 2027".'
+    )
+    system_prompt = (
+        f'This message was already classified as "{primary_category}". Decide '
+        f'whether it ALSO contains a separate, genuine "{other_category}" '
+        "request in the same message — not just a word that happens to "
+        f"relate, but an actual second ask. {other_description}\n\n"
+        "If present, extract the EXACT substring of the original message "
+        f'that states the "{other_category}" request, copied verbatim '
+        "(not rephrased, not summarized) — just the relevant part, not "
+        "the whole message. If no second request is present, set it to "
+        "null.\n\n"
+        'Respond ONLY with a JSON object: {"found": true or false, '
+        '"text": "<exact substring>" or null}'
+    )
+    payload = ai_client.build_chat_payload(
+        AZURE_OPENAI_CHAT_DEPLOYMENT,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=200,
+        response_format={"type": "json_object"},
+    )
+
+    def _call():
+        resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise AzureOpenAIError(f"Transient error {resp.status_code}: {resp.text[:200]}")
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        raw_output = _with_retries(_call)
+        parsed = json.loads(raw_output)
+    except (AzureOpenAIError, requests.RequestException, json.JSONDecodeError) as exc:
+        logger.warning("Secondary-intent detection failed, treating as none: %s", exc)
+        return None
+
+    if parsed.get("found") is not True:
+        return None
+    fragment = parsed.get("text")
+    if not isinstance(fragment, str) or not fragment.strip():
+        return None
+    return {"category": other_category, "text": fragment.strip()}
+
+
+def _apply_dual_intent_priority(
+    belongto: str, handler_result: dict[str, Any], text: str, config: dict[str, str]
+) -> tuple[str, dict[str, Any]]:
+    """If `belongto` is "travel_request" or "helpdesk", checks for a
+    second, genuine request of the other type in the same message (see
+    _detect_secondary_intent). Fixed display priority: "helpdesk" is
+    always the top-level response, "travel_request" always ends up
+    nested under "additional_intent" — regardless of which one was
+    actually classified first. Returns `(belongto, handler_result)`
+    unchanged when no second request is found.
+    """
+    if belongto not in ("travel_request", "helpdesk"):
+        return belongto, handler_result
+
+    secondary = _detect_secondary_intent(belongto, text, config)
+    if not secondary:
+        return belongto, handler_result
+
+    if secondary["category"] == "helpdesk":
+        secondary_result = handle_helpdesk_request(secondary["text"])
+    else:
+        secondary_result = handle_travel_request(secondary["text"])
+
+    if belongto == "helpdesk":
+        # Already the required priority order.
+        return "helpdesk", {
+            **handler_result,
+            "additional_intent": {"belongto": "travel_request", **secondary_result},
+        }
+    # belongto == "travel_request", secondary is helpdesk — swap so
+    # helpdesk is always the top-level response.
+    return "helpdesk", {
+        **secondary_result,
+        "additional_intent": {"belongto": "travel_request", **handler_result},
+    }
+
+
 def handle_helpdesk_request(text: str) -> dict[str, Any]:
     """No API call, no search — help-desk questions are just tagged and
     passed through. Whatever consumes this response is responsible for
@@ -1024,6 +1137,7 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
         if classification["category"] == "travel_request":
             handler_result = handle_travel_request(text)
             belongto = "travel_request"
+            belongto, handler_result = _apply_dual_intent_priority(belongto, handler_result, text, config)
         elif classification["category"] == "query_request":
             handler_result = handle_query_request(text)
             belongto = "query_request"
@@ -1066,6 +1180,7 @@ def classify(req: func.HttpRequest) -> func.HttpResponse:
                 }
             else:
                 handler_result = handle_helpdesk_request(text)
+            belongto, handler_result = _apply_dual_intent_priority(belongto, handler_result, text, config)
 
         response_payload = {
             "type": "new",
