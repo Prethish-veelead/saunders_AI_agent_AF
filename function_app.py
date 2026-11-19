@@ -554,20 +554,24 @@ def _is_vague_helpdesk_issue(text: str, config: dict[str, str]) -> bool:
     return parsed.get("is_vague") is True
 
 
-def _detect_secondary_intent(
+def _split_dual_intent_text(
     primary_category: str, text: str, config: dict[str, str]
 ) -> Optional[dict[str, str]]:
     """When the primary classification is "travel_request" or "helpdesk",
     decide whether the SAME message also contains the other of those two
     as a separate, genuine request — e.g. "I'm going to Canada for work
     19/11-20/11, also my laptop won't turn on" (travel_request primary,
-    helpdesk secondary). Returns {"category": ..., "text": ...} naming
-    the OTHER category and the exact fragment of the message that states
-    it, or None if no second request is present. This pairing is the
-    only one currently supported — a different primary category never
-    calls this. Fails open (returns None) if the check itself errors
-    out — a broken check must never invent a second request that isn't
-    there.
+    helpdesk secondary). If so, splits the original message into two
+    short, non-overlapping fragments — one per category — so each half
+    only ever sees its own topic, never the whole combined message.
+    Returns {"primary_text": ..., "secondary_text": ...} or None if no
+    second request is present. This pairing is the only one currently
+    supported — a different primary category never calls this. Fails
+    open (returns None) if the check errors out, or if either fragment
+    looks like it's just the whole message again (the split didn't
+    actually isolate anything) — a broken or unreliable split must
+    never invent a second request or echo the full text back as if it
+    were isolated.
     """
     other_category = "helpdesk" if primary_category == "travel_request" else "travel_request"
     url = (
@@ -590,13 +594,27 @@ def _detect_secondary_intent(
         f'whether it ALSO contains a separate, genuine "{other_category}" '
         "request in the same message — not just a word that happens to "
         f"relate, but an actual second ask. {other_description}\n\n"
-        "If present, extract the EXACT substring of the original message "
-        f'that states the "{other_category}" request, copied verbatim '
-        "(not rephrased, not summarized) — just the relevant part, not "
-        "the whole message. If no second request is present, set it to "
-        "null.\n\n"
+        "If present, split the ORIGINAL message into exactly two short "
+        f'fragments: one stating the "{primary_category}" request, one '
+        f'stating the "{other_category}" request. Each fragment is '
+        "copied VERBATIM from the original message — never rephrased, "
+        "never summarized — and each must be as SHORT as possible while "
+        "still being a complete statement of that one request; drop "
+        'connecting words ("also", "and", "can you help me with") that '
+        "don't belong to either request specifically. Neither fragment "
+        "may be the whole original message, or anywhere close to it — "
+        "if you can't shorten a fragment down to just its own topic, the "
+        "split has failed.\n\n"
+        'Example — "I am going to Canada for work on 19/11/2026 to '
+        '20/11/2026. can you help me with travel request and my laptop '
+        'is not turning on." splits into "I am going to Canada for work '
+        'on 19/11/2026 to 20/11/2026" (travel_request) and "my laptop '
+        'is not turning on" (helpdesk) — two short, non-overlapping '
+        "fragments.\n\n"
+        "If no second request is present, leave both fields null.\n\n"
         'Respond ONLY with a JSON object: {"found": true or false, '
-        '"text": "<exact substring>" or null}'
+        '"primary_text": "<fragment>" or null, '
+        '"secondary_text": "<fragment>" or null}'
     )
     payload = ai_client.build_chat_payload(
         AZURE_OPENAI_CHAT_DEPLOYMENT,
@@ -604,7 +622,7 @@ def _detect_secondary_intent(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
-        max_tokens=200,
+        max_tokens=300,
         response_format={"type": "json_object"},
     )
 
@@ -619,15 +637,29 @@ def _detect_secondary_intent(
         raw_output = _with_retries(_call)
         parsed = json.loads(raw_output)
     except (AzureOpenAIError, requests.RequestException, json.JSONDecodeError) as exc:
-        logger.warning("Secondary-intent detection failed, treating as none: %s", exc)
+        logger.warning("Dual-intent split failed, treating as no secondary intent: %s", exc)
         return None
 
     if parsed.get("found") is not True:
         return None
-    fragment = parsed.get("text")
-    if not isinstance(fragment, str) or not fragment.strip():
+    primary_text = parsed.get("primary_text")
+    secondary_text = parsed.get("secondary_text")
+    if not isinstance(primary_text, str) or not primary_text.strip():
         return None
-    return {"category": other_category, "text": fragment.strip()}
+    if not isinstance(secondary_text, str) or not secondary_text.strip():
+        return None
+    primary_text, secondary_text = primary_text.strip(), secondary_text.strip()
+
+    # Sanity check: a genuine split produces two fragments each clearly
+    # shorter than the original — if either one is nearly as long as the
+    # whole message, the model failed to isolate anything and just
+    # echoed it back, which is worse than not splitting at all.
+    original_len = len(text.strip())
+    if original_len and (len(primary_text) >= 0.85 * original_len or len(secondary_text) >= 0.85 * original_len):
+        logger.warning("Dual-intent split looked unreliable (a fragment nearly as long as the whole message); skipping.")
+        return None
+
+    return {"primary_text": primary_text, "secondary_text": secondary_text}
 
 
 def _apply_dual_intent_priority(
@@ -635,7 +667,7 @@ def _apply_dual_intent_priority(
 ) -> tuple[str, dict[str, Any]]:
     """If `belongto` is "travel_request" or "helpdesk", checks for a
     second, genuine request of the other type in the same message (see
-    _detect_secondary_intent). Fixed display priority: "helpdesk" is
+    _split_dual_intent_text). Fixed display priority: "helpdesk" is
     always the top-level response, "travel_request" always ends up
     nested under "additional_intent" — regardless of which one was
     actually classified first. Returns `(belongto, handler_result)`
@@ -644,23 +676,31 @@ def _apply_dual_intent_priority(
     if belongto not in ("travel_request", "helpdesk"):
         return belongto, handler_result
 
-    secondary = _detect_secondary_intent(belongto, text, config)
-    if not secondary:
+    split = _split_dual_intent_text(belongto, text, config)
+    if not split:
         return belongto, handler_result
 
-    if secondary["category"] == "helpdesk":
-        secondary_result = handle_helpdesk_request(secondary["text"])
+    other_category = "helpdesk" if belongto == "travel_request" else "travel_request"
+    if other_category == "helpdesk":
+        secondary_result = handle_helpdesk_request(split["secondary_text"])
     else:
-        secondary_result = handle_travel_request(secondary["text"])
+        secondary_result = handle_travel_request(split["secondary_text"])
 
     if belongto == "helpdesk":
-        # Already the required priority order.
+        # Already the required priority order — just swap in the
+        # isolated helpdesk-only text for "question" instead of the full
+        # combined message (keeps any greeting/vague-issue status and
+        # message already computed, untouched).
+        primary_result = {**handler_result, "question": split["primary_text"]}
         return "helpdesk", {
-            **handler_result,
+            **primary_result,
             "additional_intent": {"belongto": "travel_request", **secondary_result},
         }
     # belongto == "travel_request", secondary is helpdesk — swap so
-    # helpdesk is always the top-level response.
+    # helpdesk is always the top-level response. Travel's own extracted
+    # fields are already correctly isolated by its own extraction logic
+    # (it only ever pulls recognized travel fields), so handler_result
+    # doesn't need rebuilding from primary_text.
     return "helpdesk", {
         **secondary_result,
         "additional_intent": {"belongto": "travel_request", **handler_result},

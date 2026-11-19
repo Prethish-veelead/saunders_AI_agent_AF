@@ -254,13 +254,15 @@ Since 2026-11-19. A single fresh message can state both a travel request and a h
 ```json
 {
   "type": "new", "belongto": "helpdesk", "status": "complete",
-  "question": "I am going to Canada for work on 19/11/2026 to 20/11/2026. can you help me with travel request and my laptop is not turning on.",
+  "question": "my laptop is not turning on",
   "additional_intent": {
     "belongto": "travel_request", "status": "complete",
     "extracted": [{ "destinationCountry": "Canada", "startDate": "2026-11-19", "endDate": "2026-11-20", "reason": "work", "requestFor": null }]
   }
 }
 ```
+
+**Both sides see only their own topic — since 2026-11-19.** The original message is split into two short, non-overlapping fragments (one per category), each copied verbatim but trimmed down to just its own request — `question` above is `"my laptop is not turning on"`, never the whole combined sentence. This matters because `helpdesk`'s `question` is what a downstream KB search actually searches against; sending it the whole mixed sentence would hurt match quality. A deterministic sanity check rejects the split entirely (falling back to no `additional_intent` at all, same as before this feature existed) if either fragment comes back nearly as long as the original message — a sign the split failed rather than succeeded — so a bad split is quietly dropped, never shown as if it worked.
 
 **Fixed display priority, not sentence order:** `helpdesk` is always the top-level response and `travel_request` always ends up nested under `additional_intent`, regardless of which one was mentioned first in the message or which one classification actually picked as primary — "my laptop is not turning on, also I'm going to Canada..." and "I'm going to Canada..., also my laptop is not turning on" both produce the exact same shape above. This lets the consuming system act on a single, consistent signal: *if `additional_intent.belongto == "travel_request"` is present, trigger that piece separately* — the Help Desk AI answers the top-level question as normal, and the travel request (complete or still asking a follow-up question, with its own `missing_field_path`) is handled independently.
 
@@ -378,6 +380,7 @@ Set via Function App settings in Azure (or `local.settings.json` for local devel
 
 Dated, most recent first. Reflects changes to the deployed behavior of this Function App — not internal testing activity.
 
+- **2026-11-19** — Fixed the dual-intent split (added earlier the same day) to reliably isolate each side's text. It previously extracted a single fragment for whichever category was secondary, but left the primary `helpdesk` response's `question` field as the full original combined message most of the time (confirmed live: correct only ~1 in 4 tries) — now both fragments are produced together in one pass, with an explicit worked example in the prompt and a deterministic length check that rejects the split entirely (falling back to no `additional_intent`) if either fragment comes back nearly as long as the original message. Live and verified on client: 10/10 consistent across repeated calls in both sentence orders, single-topic messages unaffected.
 - **2026-11-19** — A single message stating both a travel request and a helpdesk issue ("I am going to Canada for work on 19/11/2026 to 20/11/2026, can you help me with travel request and my laptop is not turning on") no longer drops whichever one classification didn't pick as primary. Once the primary category is `travel_request` or `helpdesk`, one additional check decides whether the message also contains a genuine request of the other kind, and if so runs it through its own unchanged handler and attaches it under a new `additional_intent` field. Fixed display priority regardless of sentence order: `helpdesk` is always the top-level response, `travel_request` always ends up under `additional_intent`. A message with only one real topic is completely unaffected — no `additional_intent` field appears at all. Live and verified on client: 12/12 new checks passing (both sentence orders, single-topic messages unaffected), existing regression suite unaffected.
 
 - **2026-10-21** — A helpdesk message that states having an issue but names no actual symptom ("I got another issue", "I have another issue", "I have a problem") now gets a clarifying question — *"What kind of issue are you facing? Please describe it so I can help."* — instead of being passed through content-free to whatever downstream system searches a knowledge base for it (which would otherwise find nothing to match). Also fixed the classifier rule that was causing these messages to land in `general_query` instead of `helpdesk` in the first place (no IT term or travel word is present to match any existing rule) — an unspecified issue/problem now defaults to `helpdesk`, the same reasoning already used for a bare "hi helpdesk" greeting. Live and verified on client.
